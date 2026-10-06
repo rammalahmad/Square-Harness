@@ -16,6 +16,14 @@ EFFORTS = {
 LABELS = {'low': 'Low', 'medium': 'Medium', 'high': 'High', 'xhigh': 'Extra high', 'poincare': 'Poincaré'}
 
 
+def level(mode, name):
+    """An effort level's budgets for a worker mode: a detailed review gets twice the tokens, input and time."""
+    value = dict(EFFORTS.get(name, EFFORTS['medium']))
+    if mode == 'detailed_review':
+        value.update(tokens=2 * value['tokens'], input=2 * value['input'], minutes=2 * value['minutes'])
+    return value
+
+
 def _proof_ceilings(args, tokens):
     """Fit one full solve and its review in the budget, keeping the launch repair floors."""
     solve, verify = args.proof_solve_tokens, args.proof_verify_tokens
@@ -39,7 +47,11 @@ def limits(mode, level, args):
     if mode == 'check':
         # A literature check has its own small budgets (refcheck.EFFORTS), chosen by level.
         return dict(effort=level if level in EFFORTS else 'medium')
-    if mode in ('literature', 'referee'):
+    if mode == 'detailed_review':
+        # A detailed review also checks the proofs: twice the tokens, context and time of a review.
+        return dict(rounds=effort['tries'], tokens=2 * effort['tokens'], input_tokens=2 * effort['input'], seconds=2 * seconds,
+                    requests=effort['requests'], chars=effort['chars'])
+    if mode in ('literature', 'referee', 'quick_review', 'explain'):
         return dict(rounds=effort['tries'], tokens=effort['tokens'], input_tokens=effort['input'], seconds=seconds,
                     requests=effort['requests'], chars=effort['chars'])
     return {}

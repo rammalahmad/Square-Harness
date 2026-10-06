@@ -580,7 +580,9 @@ class AssistantGuiTests(GuiCase):
         self.assertNotIn('check_reference', names(self.fake.requests[-2]))
 
     def test_large_previous_report_is_reference_context_not_an_oversized_literature_goal(self):
-        self.hub.args.ctx = 40960  # the exact conversation fits when supplied only once
+        # The exact conversation fits when supplied only once (twice would need about 55k), with some room
+        # for the Assistant policy and worker list to grow.
+        self.hub.args.ctx = 41984
         chat = self.conversation(online=False)
         source = 'Hypotheses: a is real, c > 0, and T > T0.\nKeep every quantifier unchanged.\n'
         (self.root / 'hypotheses.tex').write_text(source)

@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { callPayload, modeQuery, updateCall, validCall, MODE_CALLS } from '../src/modeCalls.ts'
+import { callPayload, coverOf, modeOptions, modeQuery, updateCall, validCall, MODE_CALLS } from '../src/modeCalls.ts'
 
 test('offers modes at the caret at the start, middle and end of a prompt', () => {
   for (const text of ['@pro', 'Please @pro show this', 'Show this (@pro)']) {
@@ -12,7 +12,20 @@ test('offers modes at the caret at the start, middle and end of a prompt', () =>
   assert.equal(modeQuery('@@prove', 7), null)
   assert.equal(modeQuery('@pro', 0, 4), null)
   assert.equal(MODE_CALLS.filter((item) => item.mode.startsWith('pro')).length, 1)
-  assert.deepEqual(MODE_CALLS.map((item) => item.mode), ['prove', 'check', 'literature', 'referee'])
+  assert.deepEqual(MODE_CALLS.map((item) => item.mode),
+    ['prove', 'check', 'literature', 'quick_review', 'referee', 'detailed_review', 'explain'])
+})
+
+test('the review kinds are offered together and drawn as Review pages', () => {
+  assert.deepEqual(modeOptions('review').map((item) => item.mode), ['quick_review', 'referee', 'detailed_review'])
+  assert.deepEqual(modeOptions('quick').map((item) => item.mode), ['quick_review'])
+  assert.deepEqual(modeOptions('ex').map((item) => item.mode), ['explain'])
+  assert.deepEqual(modeOptions('pro').map((item) => item.mode), ['prove'])
+  assert.equal(coverOf('detailed_review'), 'referee')
+  assert.equal(coverOf('check'), 'check')
+  const text = 'Please @quick_review Lemma 2'
+  assert.ok(validCall(text, { mode: 'quick_review', start: 7, end: 20 }))
+  assert.deepEqual(callPayload(text, { mode: 'quick_review', start: 7, end: 20 }), { mode: 'quick_review', start: 7 })
 })
 
 test('literal, unknown, and unconfirmed calls never produce execution metadata', () => {

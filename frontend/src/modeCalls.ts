@@ -1,10 +1,21 @@
 import type { RouteMode } from './api'
+import type { Mode } from './router'
+
+/** The notebook cover a mode call is drawn with: the review kinds are pages of the Review notebook. */
+export const coverOf = (mode: RouteMode): Mode | 'check' =>
+  mode === 'quick_review' || mode === 'detailed_review' || mode === 'explain' ? 'referee' : mode
 export const MODE_CALLS: { mode: RouteMode; label: string; summary: string }[] = [
   { mode: 'prove', label: 'Prove', summary: 'Prove a statement, review the proof, and repair objections.' },
   { mode: 'check', label: 'Reference check', summary: 'Find or verify a reference for a known result.' },
   { mode: 'literature', label: 'Literature', summary: 'Build a verified reading list on a topic.' },
-  { mode: 'referee', label: 'Review', summary: 'Review a manuscript and report precise issues.' },
+  { mode: 'quick_review', label: 'Quick review', summary: 'Check whether a given proof is correct: verdict and located issues.' },
+  { mode: 'referee', label: 'Review', summary: 'Review a manuscript: overview of the paper, typos and presentation.' },
+  { mode: 'detailed_review', label: 'Detailed review', summary: 'Review a manuscript and also check its proofs (more tokens and time).' },
+  { mode: 'explain', label: 'Explain', summary: 'Explain a result and its proof precisely, step by step.' },
 ]
+/** The calls a typed @word offers: by mode, or by any word of the label (@review offers every review). */
+export const modeOptions = (query: string) => MODE_CALLS.filter((item) => item.mode.startsWith(query)
+  || item.label.toLowerCase().split(/\s+/).some((word) => word.startsWith(query)))
 export type ModeCall = { mode: RouteMode; start: number; end: number }
 export type ModeQuery = { start: number; end: number; query: string }
 const word = (char: string) => /[\p{L}\p{N}_@.+/\-]/u.test(char)

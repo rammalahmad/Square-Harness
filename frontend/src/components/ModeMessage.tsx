@@ -1,5 +1,5 @@
 import { useEffect, useId, useLayoutEffect, useRef, useState, type KeyboardEvent } from 'react'
-import { MODE_CALLS, modeQuery, updateCall, validCall, type ModeCall, type ModeQuery } from '../modeCalls'
+import { coverOf, modeOptions, modeQuery, updateCall, validCall, type ModeCall, type ModeQuery } from '../modeCalls'
 import { CloseIcon } from './Icons'
 import { Glyph } from './Glyph'
 import './ModeMessage.css'
@@ -16,7 +16,7 @@ export function ModeMessage({ value, onChange, call, onCall, onSend, disabled }:
   const queryRef = useRef<ModeQuery | null>(null)
   const dismissed = useRef<{ text: string; start: number } | null>(null)
   const [active, setActive] = useState(0)
-  const options = query ? MODE_CALLS.filter((item) => item.mode.startsWith(query.query)) : []
+  const options = query ? modeOptions(query.query) : []
   const open = !disabled && options.length > 0
   useLayoutEffect(() => {
     const caret = selectedCaret.current
@@ -73,7 +73,7 @@ export function ModeMessage({ value, onChange, call, onCall, onSend, disabled }:
   return (
     <div className="mode-message">
       {validCall(value, call) && <div className="selected-mode" role="status">
-        <span className={`route-cover mode-${call.mode}`}><Glyph mode={call.mode} /></span>
+        <span className={`route-cover mode-${coverOf(call.mode)}`}><Glyph mode={coverOf(call.mode)} /></span>
         <strong>@{call.mode}</strong><span>Selected for this message</span>
         <button type="button" className="chip-remove" aria-label="Clear selected mode" onClick={() => { onCall(null); setQuery(null); input.current?.focus() }}><CloseIcon size={13} /></button>
       </div>}
@@ -83,7 +83,7 @@ export function ModeMessage({ value, onChange, call, onCall, onSend, disabled }:
           {options.map((item, index) => <div key={item.mode} id={`${listId}-${index}`} role="option"
             aria-selected={index === active} className={'mode-option' + (index === active ? ' mode-option-active' : '')}
             onMouseEnter={() => setActive(index)} onMouseDown={(event) => event.preventDefault()} onClick={() => select(index)}>
-            <span className={`route-cover mode-${item.mode}`}><Glyph mode={item.mode} /></span>
+            <span className={`route-cover mode-${coverOf(item.mode)}`}><Glyph mode={coverOf(item.mode)} /></span>
             <span><strong>@{item.mode}</strong><span className="mode-option-summary">{item.summary}</span></span>
           </div>)}
         </div>

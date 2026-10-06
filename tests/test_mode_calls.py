@@ -19,6 +19,14 @@ class ModeCallValidationTests(unittest.TestCase):
         self.assertEqual(validated_mode_call('@unknown @prove show this', None),
                          ('@unknown @prove show this', None))
 
+    def test_review_kinds_are_selectable_calls(self):
+        self.assertEqual(validated_mode_call('@quick_review Lemma. A. Proof. B.', {'mode': 'quick_review', 'start': 0}),
+                         ('Lemma. A. Proof. B.', 'quick_review'))
+        self.assertEqual(validated_mode_call('Please @explain Lemma 8', {'mode': 'explain', 'start': 7}),
+                         ('Please  Lemma 8', 'explain'))
+        with self.assertRaises(ValueError):
+            validated_mode_call('@quick Lemma 8', {'mode': 'quick_review', 'start': 0})
+
     def test_stale_malformed_email_and_empty_calls_are_rejected(self):
         for content, selected in [
             ('@proven Show this', {'mode': 'prove', 'start': 0}),
@@ -37,7 +45,8 @@ class ModeCallValidationTests(unittest.TestCase):
 
 class ModeCallControllerTests(unittest.TestCase):
     def test_every_mode_executes_before_synthesis_without_a_routing_inference(self):
-        for mode in ('prove', 'critic', 'explore', 'check', 'literature', 'referee', 'writeup'):
+        for mode in ('prove', 'critic', 'explore', 'check', 'literature', 'referee', 'detailed_review',
+                     'quick_review', 'explain', 'writeup'):
             calls = []
             def worker(action, child, save):
                 calls.append(copy.deepcopy(action))
@@ -99,3 +108,33 @@ class ModeCallGuiTests(GuiCase):
                                    {'content': '@proven is text', 'mode_call': {'mode': 'prove', 'start': 0}})
         self.assertEqual(status, 400)
         self.assertEqual(self.ok('GET', f'/api/chats/{chat}')['transcript'], before)
+
+
+class ReviewModeCallGuiTests(GuiCase):
+    extra_args = ('--ctx', '40960')
+
+    def test_selected_explain_runs_the_explanation_worker(self):
+        explanation = {'says': 'Every real number equals itself.', 'idea': 'Reflexivity of equality.',
+                       'steps': [{'start_line': 2, 'end_line': 2, 'what': 'Apply reflexivity.', 'why': 'An axiom.', 'uses': 'Equality'}],
+                       'facts': [], 'hypotheses': 'None needed.', 'gaps': ''}
+        self.fake.replies = [text(json.dumps(explanation)), text(json.dumps({'problems': []})), text('Here is the explanation.')]
+        chat = self.ok('POST', '/api/chats', {'mode': 'free'})['id']
+        self.ok('POST', f'/api/chats/{chat}/route',
+                {'content': '@explain Lemma. x = x for every real x.\nProof. Reflexivity.', 'mode_call': {'mode': 'explain', 'start': 0}})
+        task = self.wait_task()
+        self.assertEqual(task['state'], 'done', task)
+        saved = self.ok('GET', f'/api/chats/{chat}')
+        [card] = [item for item in saved['transcript'] if item['role'] == 'route']
+        self.assertEqual((card['mode'], card['status']), ('explain', 'done'), card)
+        detail = self.ok('GET', f'/api/research/{card["job_id"]}')
+        self.assertEqual((detail['kind'], detail['variant']), ('referee', 'explain'))
+        self.assertIn('Apply reflexivity.', detail['draft'])
+
+
+class ReviewEffortTests(unittest.TestCase):
+    def test_a_detailed_review_worker_gets_twice_the_budget(self):
+        from mathagent.gui import effort
+        plain, detailed = effort.level('referee', 'high'), effort.level('detailed_review', 'high')
+        self.assertEqual((detailed['tokens'], detailed['input'], detailed['minutes']),
+                         (2 * plain['tokens'], 2 * plain['input'], 2 * plain['minutes']))
+        self.assertEqual(plain, effort.EFFORTS['high'])

@@ -22,7 +22,7 @@ type ChatMode = 'critic' | 'explore' | 'free'
 const INTRO: Record<ChatMode, { title: string; text: string; examples: string[] }> = {
   free: {
     title: 'What are you working on?',
-    text: 'Square Harness answers your questions and coordinates focused working agents: Prove for proof search and review, Reference check for citations, Literature for reading lists, Referee for manuscript reviews, Critic for proof gaps, Explore for possible approaches, and Write-up for LaTeX drafts. Their findings feed back into the discussion.',
+    text: 'Square Harness answers your questions and coordinates focused working agents: Prove for proof search and review, Reference check for citations, Literature for reading lists, Quick review to check a proof, Review and Detailed review for manuscripts, Explain for a result and its proof, Critic for proof gaps, Explore for possible approaches, and Write-up for LaTeX drafts. Their findings feed back into the discussion.',
     examples: [
       'Prove that every bounded sequence in $H^1(0,1)$ has a subsequence converging strongly in $L^2(0,1)$.',
       'Find a reference on the $H^2$ regularity of elliptic problems with Neumann boundary conditions.',
@@ -50,7 +50,7 @@ const INTRO: Record<ChatMode, { title: string; text: string; examples: string[] 
 
 // How a card names what the model started. Critic and explore are both an answer here;
 // a literature check also answers here, with its evidence.
-type Kind = 'answer' | 'check' | 'prove' | 'literature' | 'referee' | 'writeup'
+type Kind = 'answer' | 'check' | 'prove' | 'literature' | 'referee' | 'detailed_review' | 'quick_review' | 'explain' | 'writeup'
 // `cover` names the mark (components/Glyph.tsx) and its colour class.
 const KINDS: Record<Kind, { noun: string; label: string; cover: 'free' | 'check' | 'prove' | 'literature' | 'referee' | 'writeup' }> = {
   answer: { noun: 'an answer', label: 'Answer', cover: 'free' },
@@ -58,11 +58,16 @@ const KINDS: Record<Kind, { noun: string; label: string; cover: 'free' | 'check'
   prove: { noun: 'a proof', label: 'Proof', cover: 'prove' },
   literature: { noun: 'a literature report', label: 'Literature report', cover: 'literature' },
   referee: { noun: 'a review', label: 'Review', cover: 'referee' },
+  detailed_review: { noun: 'a detailed review', label: 'Detailed review', cover: 'referee' },
+  quick_review: { noun: 'a quick review', label: 'Quick review', cover: 'referee' },
+  explain: { noun: 'an explanation', label: 'Explanation', cover: 'referee' },
   writeup: { noun: 'a write-up', label: 'Write-up', cover: 'writeup' },
 }
 const kindOf = (mode: RouteMode): Kind => (mode === 'critic' || mode === 'explore' ? 'answer' : mode)
 const effortKind = (mode: RouteMode): EffortKind | null =>
-  mode === 'prove' ? 'proof' : mode === 'writeup' ? 'writeup' : mode === 'literature' || mode === 'referee' ? 'research' : null
+  mode === 'prove' ? 'proof' : mode === 'writeup' ? 'writeup' : ['literature', 'referee', 'detailed_review', 'quick_review', 'explain'].includes(mode) ? 'research' : null
+// Quick reviews and explanations are pages of the Review notebook.
+const pageOf = (mode: Exclude<RouteMode, 'check'>) => (mode === 'quick_review' || mode === 'explain' || mode === 'detailed_review' ? 'referee' : mode)
 const effortLabel = (effort?: string) => EFFORTS.find((item) => item.id === (isLevel(effort) ? effort : 'medium'))!.label
 
 export function ChatView({ mode, id }: { mode: ChatMode; id: string | null }) {
@@ -261,7 +266,8 @@ function Intro({ mode, onPick }: { mode: ChatMode; onPick: (text: string) => voi
         <p className="lede">{intro.text}</p>
         {mode === 'free' && <p className="lede">
           To force a worker, type <code>@</code> anywhere in your prompt and confirm a choice in the popup.
-          The available calls are <code>@prove</code>, <code>@check</code>, <code>@literature</code>, and <code>@referee</code>.
+          The available calls are <code>@prove</code>, <code>@check</code>, <code>@literature</code>, <code>@quick_review</code>,
+          {' '}<code>@referee</code> (a review), <code>@detailed_review</code> and <code>@explain</code>.
           Unconfirmed <code>@</code> text stays part of your message.
         </p>}
         <div className="examples">
@@ -461,7 +467,7 @@ function RouteCard({ chatId, index, item }: { chatId: string; index: number; ite
               {item.orchestrated && running ? <PauseIcon size={14} /> : <CloseIcon size={14} />} {item.orchestrated && running ? 'Pause assistant' : 'Cancel'}
             </button>
           )}
-          {item.job_id && mode !== 'check' && <a className="btn btn-small btn-quiet" href={href(mode, item.job_id, null, chatId)}>Open the {info.label.toLowerCase()}</a>}
+          {item.job_id && mode !== 'check' && <a className="btn btn-small btn-quiet" href={href(pageOf(mode), item.job_id, null, chatId)}>Open the {info.label.toLowerCase()}</a>}
           {!item.orchestrated && ['proposed', 'failed', 'cancelled'].includes(item.status || '') && (
             <button type="button" className="btn btn-small" disabled={acting} onClick={start}>
               {item.status === 'proposed' ? 'Start' : 'Start again'}
