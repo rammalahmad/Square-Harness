@@ -1,6 +1,7 @@
 """Explicitly selected GUI mode calls, without interpreting ordinary @ text."""
 from .orchestrator import Orchestrator
 from .router import JOB_MODES
+from .source_tasks import automatic_source_action
 
 
 def _word(char):
@@ -44,12 +45,16 @@ class ModeOrchestrator(Orchestrator):
 
     def _new_state(self, query, files, history):
         super()._new_state(query, files, history)
-        if self.required_mode is None:
+        action = ({'mode': self.required_mode, 'request': query, 'files': list(files),
+                   'effort': 'medium', 'reason': 'User explicitly selected @' + self.required_mode + '.'}
+                  if self.required_mode is not None else automatic_source_action(query, files))
+        if action is None:
             return
-        action = {'mode': self.required_mode, 'request': query, 'files': list(files),
-                  'effort': 'medium', 'reason': 'User explicitly selected @' + self.required_mode + '.'}
         self._validate_delegate(action)
-        self.state['required_mode'] = self.required_mode
+        if self.required_mode is not None:
+            self.state['required_mode'] = self.required_mode
+        else:
+            self.state['automatic_source_mode'] = action['mode']
         self._prepare_calls({'role': 'assistant', 'content': '', 'tool_calls': [
             {'id': self.state['id'] + '_mode_call', 'type': 'function',
              'function': {'name': 'delegate', 'arguments': action}}]})

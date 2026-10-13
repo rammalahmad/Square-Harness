@@ -75,18 +75,6 @@ class Agent:
         schemas = self.workspace.schemas()
         for round_no in range(self.max_rounds + 1):
             tools = schemas if round_no < self.max_rounds else []
-            # Conservative byte budget, not an exact tokenizer. Drop ONLY whole
-            # old user turns; never truncate a tool call/result pair or current turn.
-            budget = max(2000, (self.ctx - self.predict - 512) * 3)
-            def input_size():
-                return len(json.dumps([system] + messages, ensure_ascii=False).encode()) + len(json.dumps(tools))
-            while input_size() > budget:
-                user_indices = [i for i, m in enumerate(messages) if m['role'] == 'user']
-                if len(user_indices) < 2:
-                    raise AgentError('Current turn exceeds the approximate input budget. Use smaller excerpts, '
-                                     '/clear, increase /context, or reduce --predict. This turn was not saved.')
-                messages = messages[user_indices[1]:]
-                emit('notice', 'Dropped the oldest complete turn to fit the approximate context budget.')
             payload = {'model': self.model, 'messages': [system] + messages, 'stream': True,
                        'think': self.think, 'options': {'num_ctx': self.ctx, 'num_predict': self.predict,
                            'temperature': self.temperature, 'top_p': self.top_p}}
@@ -94,6 +82,12 @@ class Agent:
                 payload['options']['seed'] = (self.seed + round_no) % (2 ** 31)
             if tools:
                 payload['tools'] = tools
+            # The complete native request is counted, including tool schemas.
+            # Context fitting adjusts output room, never mathematical premises.
+            from .call_policy import allocate_call
+            payload, allocation = allocate_call(self.client, payload, self.predict,
+                explicit_cap=getattr(self, 'document_output_cap', None))
+            self.last_allocation = allocation
             emit('start', '')
             assistant = {'role': 'assistant', 'content': ''}
             calls, thinking, done = [], '', False

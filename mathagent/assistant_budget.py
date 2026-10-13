@@ -1,4 +1,4 @@
-"""Durable inference accounting shared by a bounded concurrent Assistant tree."""
+"""Durable inference accounting shared by a concurrent Assistant tree."""
 import json
 import math
 import threading
@@ -23,7 +23,7 @@ class _Pool:
 
 
 class BudgetClient:
-    def __init__(self, client, *, state=None, max_tokens=60000, max_input_tokens=240000,
+    def __init__(self, client, *, state=None, max_tokens=None, max_input_tokens=None,
                  max_seconds=900, checkpoint=lambda: None, concurrency=2, pool=None,
                  allowance=None, usage=None, adaptive_limits=None):
         self.client = client
@@ -34,11 +34,19 @@ class BudgetClient:
             budget['adaptive_limits'] = dict(adaptive_limits)
         for key in ('tokens', 'input_tokens', 'seconds', 'max_tokens', 'max_input_tokens', 'max_seconds'):
             value = budget.get(key)
+            if value is None and key in ('max_tokens', 'max_input_tokens'):
+                continue
             if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
                 raise ValueError('Invalid Assistant budget: ' + key)
         for key, value in budget.get('adaptive_limits', {}).items():
-            if key not in ('max_tokens', 'max_input_tokens', 'max_seconds') or isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value < budget[key]:
+            if key not in ('max_tokens', 'max_input_tokens', 'max_seconds') or budget[key] is None or isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value < budget[key]:
                 raise ValueError('Invalid adaptive Assistant ceiling: ' + key)
+        reserved = budget.get('reserved_tokens', 0)
+        if type(reserved) is not int or not 0 <= reserved <= budget['tokens']:
+            raise ValueError('Invalid Assistant budget: reserved_tokens')
+        # A restored process cannot still own its old streams. Their charged
+        # reservations remain spent, but are no longer displayed as in flight.
+        budget['reserved_tokens'] = 0
         self.pool = pool or _Pool(budget, checkpoint, concurrency)
         self.allowance = allowance
         self.usage = usage if usage is not None else {'tokens': 0, 'input_tokens': 0}
@@ -64,13 +72,14 @@ class BudgetClient:
             for key, value in requested.items():
                 if key not in ('max_tokens', 'max_input_tokens', 'max_seconds') or isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0:
                     raise ValueError('Invalid requested Assistant limit: ' + key)
-                if key in ceilings:
+                if key in ceilings and self.pool.state[key] is not None:
                     self.pool.state[key] = max(self.pool.state[key], min(value, ceilings[key]))
 
     @property
     def remaining_tokens(self):
         with self.pool.lock:
-            remaining = max(0, self.pool.state['max_tokens'] - self.pool.state['tokens'])
+            limit = self.pool.state['max_tokens']
+            remaining = math.inf if limit is None else max(0, limit - self.pool.state['tokens'])
             if self.allowance is not None:
                 remaining = min(remaining, max(0, self.allowance - self.usage['tokens']))
             return remaining
@@ -117,27 +126,34 @@ class BudgetClient:
         if self.remaining_seconds <= 0:
             raise AssistantBudget('Assistant time budget exhausted.')
         count, method = count_input(self.client, payload)
-        if method != 'server token count':
-            count += len(json.dumps(payload.get('tools', []), ensure_ascii=False).encode())
         if count + cap + 1 > payload['options']['num_ctx']:
             raise AgentError('The complete Assistant context does not fit. No hypotheses or worker results were clipped.')
         with self.pool.lock:
+            # Older saved adaptive turns may have reached their initial cap
+            # through source reads before delegating. Honor only their saved
+            # ceilings when fitting the next complete request.
+            self.ensure_limits(max_tokens=self.pool.state['tokens'] + cap,
+                               max_input_tokens=self.pool.state['input_tokens'] + count)
             if type(cap) is not int or cap <= 0 or cap > self.remaining_tokens:
                 raise AssistantBudget('Assistant output budget cannot cover the next model call.')
-            if self.pool.state['input_tokens'] + count > self.pool.state['max_input_tokens']:
+            input_limit = self.pool.state['max_input_tokens']
+            if input_limit is not None and self.pool.state['input_tokens'] + count > input_limit:
                 raise AssistantBudget('Assistant input budget exhausted; no mathematical context was clipped.')
             # Reserve before dispatch. Interrupted or unaccounted calls retain
             # their allowance, so a resume cannot spend those tokens twice.
             self.pool.state['tokens'] += cap
+            self.pool.state['reserved_tokens'] += cap
             self.pool.state['input_tokens'] += count
             self.usage['tokens'] += cap
             self.usage['input_tokens'] += count
         self.pool.checkpoint()
         previous_timeout = self.client.timeout
         self.client.timeout = max(0.1, min(previous_timeout, self.remaining_seconds))
-        events = self.client.stream(payload)
+        events = None
         charged = False
+        reserved = True
         try:
+            events = self.client.stream(payload)
             for event in events:
                 if self.remaining_seconds <= 0:
                     raise AssistantBudget('Assistant time budget exhausted during generation.')
@@ -149,13 +165,21 @@ class BudgetClient:
                     if used is not None:
                         if type(used) is not int or used < 0 or used > cap:
                             raise AssistantBudget('Model usage exceeded the reserved Assistant allowance.')
-                        with self.pool.lock:
+                    with self.pool.lock:
+                        self.pool.state['reserved_tokens'] -= cap
+                        reserved = False
+                        if used is not None:
                             self.pool.state['tokens'] -= cap - used
                             self.usage['tokens'] -= cap - used
                     self.pool.checkpoint()
                 yield event
         finally:
-            if hasattr(events, 'close'):
-                events.close()
-            self.client.timeout = previous_timeout
-            self.pool.checkpoint()
+            try:
+                if hasattr(events, 'close'):
+                    events.close()
+            finally:
+                with self.pool.lock:
+                    if reserved:
+                        self.pool.state['reserved_tokens'] -= cap
+                self.client.timeout = previous_timeout
+                self.pool.checkpoint()

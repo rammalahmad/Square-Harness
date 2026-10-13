@@ -13,6 +13,7 @@ import re
 import stat
 import tempfile
 import threading
+import time
 import uuid
 
 from ..ledger import ProofStore, _ID, _ARTIFACT, _atomic_write, _directory, _read, _regular, _now, _sync_directory
@@ -159,6 +160,30 @@ def _budget(used, limit):
     return {'used': used, 'limit': limit}
 
 
+def _output_budget(state, running):
+    """Keep in-flight capacity separate from settled cumulative output."""
+    charged = state['tokens_charged']
+    reserved = min(charged, sum(call.get('reserved_tokens', 0) for call in state['calls']
+                                if running and call.get('status') == 'running'
+                                and 'charged_tokens' not in call))
+    return {**_budget(charged - reserved, state['settings']['max_tokens']), 'reserved': reserved}
+
+
+def _live_context(call):
+    allocation = (call or {}).get('allocation') or (call or {}).get('context') or {}
+    if 'input_tokens' in allocation and 'context_tokens' in allocation:
+        return {'context': _budget(allocation['input_tokens'], allocation['context_tokens'])}
+    return {}
+
+
+def _working_time(state, running):
+    used = state['seconds_used']
+    checkpoint = state.get('active_checkpoint_wall')
+    if running and isinstance(checkpoint, (int, float)):
+        used += max(0, time.time() - checkpoint)
+    return _budget(round(used, 1), state['settings']['max_seconds'])
+
+
 def _review_counts(state):
     """Candidates by review status. Legacy v1 jobs recorded claims instead and show none."""
     counts = {}
@@ -196,7 +221,7 @@ def list_proofs(root, active=None):
                      'created_at': state['created_at'], 'running': running,
                      'sources': [s['path'] for s in state['sources']],
                      'rounds': _budget(state['rounds_started'], state['settings']['max_rounds']),
-                     'tokens': _budget(state['tokens_charged'], state['settings']['max_tokens']),
+                     'tokens': _output_budget(state, running),
                      'reviews': _review_counts(state)})
     return sorted(jobs, key=lambda job: job['updated_at'], reverse=True)
 
@@ -215,8 +240,10 @@ def proof_detail(root, proof_id, active=None):
         'created_at': s['created_at'], 'updated_at': s['updated_at'], 'revision': s['revision'],
         'settings': settings,
         'budget': {'rounds': _budget(s['rounds_started'], settings['max_rounds']),
-                   'tokens': _budget(s['tokens_charged'], settings['max_tokens']),
-                   'seconds': _budget(round(s['seconds_used'], 1), settings['max_seconds'])},
+                   'tokens': _output_budget(s, running),
+                   'seconds': _working_time(s, running),
+                   **_live_context(call)},
+        'progress': s.get('progress'),
         'sources': [{'path': src['path'], 'sha256': src.get('sha256'),
                      'lines': len(src['content'].splitlines())} for src in s['sources']],
         'calls': s['calls'], 'running': running,
@@ -301,7 +328,7 @@ def list_research(root, active=None):
                      'updated_at': state['updated_at'], 'created_at': state['created_at'],
                      'running': running, 'sources': [s['path'] for s in state['sources']],
                      'variant': state.get('variant'), 'verdict': state.get('verdict') or None,
-                     'tokens': _budget(state['tokens_charged'], state['settings']['max_tokens'])})
+                     'tokens': _output_budget(state, running)})
     return sorted(jobs, key=lambda job: job['updated_at'], reverse=True)
 
 
@@ -318,11 +345,13 @@ def research_detail(root, job_id, active=None):
         'stop_reason': s.get('stop_reason'), 'created_at': s['created_at'], 'updated_at': s['updated_at'],
         'settings': settings,
         'budget': {'rounds': _budget(s['rounds_started'], settings['max_rounds']),
-                   'tokens': _budget(s['tokens_charged'], settings['max_tokens']),
+                   'tokens': _output_budget(s, running),
                    'input_tokens': _budget(s['input_tokens_charged'], settings['max_input_tokens']),
-                   'seconds': _budget(round(s['seconds_used'], 1), settings['max_seconds']),
+                   'seconds': _working_time(s, running),
                    'requests': _budget(usage.get('requests', 0), settings['max_requests']),
-                   'chars': _budget(usage.get('returned_chars', 0), settings['max_chars'])},
+                   'chars': _budget(usage.get('returned_chars', 0), settings['max_chars']),
+                   **_live_context(call)},
+        'progress': s.get('progress'),
         'sources': [{'id': src['id'], 'path': src['path'], 'sha256': src['sha256'],
                      'lines': len(src['content'].splitlines())} for src in s['sources']],
         'plan': s['plan'], 'notes': s['notes'], 'evidence': s['evidence'], 'draft': s['draft'],
@@ -627,9 +656,23 @@ def assistant_view(chat):
     status = state.get('status')
     status = 'paused' if status in ('interrupted', 'incomplete') else status
     budget = state.get('budget') or {}
+    reserved = budget.get('reserved_tokens', 0)
+    progress = state.get('progress')
+    if not isinstance(progress, dict):
+        progress = next((child.get('result', {}).get('progress')
+                         for child in reversed(state.get('children') or [])
+                         if isinstance(child.get('result'), dict)
+                         and isinstance(child['result'].get('progress'), dict)), None)
+    last_call = state.get('last_call') or {}
+    context = _live_context(last_call) if status == 'running' and last_call.get('status') == 'running' else {}
     return {'assistant_status': status,
-            'assistant_budget': {'tokens': _budget(budget.get('tokens', 0), budget.get('max_tokens', 60000)),
-                                 'seconds': _budget(round(budget.get('seconds', 0), 1), budget.get('max_seconds', 900))}}
+            'assistant_resumable': status in ('paused', 'running'),
+            'assistant_progress': progress,
+            'assistant_budget': {'tokens': {**_budget(max(0, budget.get('tokens', 0) - reserved), budget.get('max_tokens')),
+                                             'reserved': reserved},
+                                 'input_tokens': _budget(budget.get('input_tokens', 0), budget.get('max_input_tokens')),
+                                 'seconds': _budget(round(budget.get('seconds', 0), 1), budget.get('max_seconds', 900)),
+                                 **context}}
 
 
 # -- workspace settings, folders, uploads and templates -------------------------------

@@ -58,7 +58,7 @@ export function EffortSlider({ kind, defaults, level, onLevel, custom, compact, 
       </div>
       <p className={'field-hint effort-summary' + (compact ? ' effort-summary-compact' : '')}>
         {describeLimits(kind, limits)}{custom ? '; changed in Advanced limits below' : ''}.
-        {poincare && !compact && ' The Poincaré effort can run for two hours; you can pause it at any time.'}
+        {poincare && !compact && ' Work is saved at a pause; unfinished checks stay explicit.'}
       </p>
     </div>
   )

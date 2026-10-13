@@ -175,6 +175,7 @@ class OpenAICompatible:
                 raise ValueError('Invalid count or model context')
         except (ValueError, KeyError, TypeError, OSError, HTTPException) as exc:
             raise AgentError('Malformed tokenizer response from model server') from exc
+        self.observed_context_tokens = context
         requested = payload.get('options', {}).get('num_ctx')
         if type(requested) is int and requested > context:
             raise AgentError(f'Requested context {requested} exceeds server context {context}')
@@ -387,6 +388,7 @@ class LlamaCpp(OpenAICompatible):
             if not isinstance(props.get('chat_template'), str) or not props['chat_template'].strip():
                 raise AgentError('llama.cpp must expose its configured chat template through /props')
             self._properties = props
+            self.observed_context_tokens = context
         return copy.deepcopy(self._properties)
 
     def _count_input_tokens(self, data):
@@ -397,6 +399,7 @@ class LlamaCpp(OpenAICompatible):
 
     def count_input_tokens(self, payload):
         """Count a native request after the server applies its exact chat template."""
+        self.properties()
         return self._count_input_tokens(self._payload(payload))
 
     def stream(self, payload):

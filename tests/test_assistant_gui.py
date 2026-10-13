@@ -127,6 +127,12 @@ class AssistantGuiTests(GuiCase):
         self.assertLessEqual(request['options']['num_predict'], 8192)  # a direct answer may be a full explanation
         self.assertIn('delegate', [schema['function']['name'] for schema in request['tools']])
         self.assertEqual(detail['assistant_budget']['tokens']['used'], 37)
+        self.assertIsNone(detail['assistant_budget']['tokens']['limit'])
+        self.assertEqual(detail['assistant_budget']['tokens']['reserved'], 0)
+        self.assertIsNone(detail['assistant_budget']['input_tokens']['limit'])
+        saved = store.load_chat(self.root, chat)['assistant_state']['budget']
+        self.assertIsNone(saved['max_tokens'])
+        self.assertIsNone(saved['max_input_tokens'])
         self.assertEqual(self.ok('GET', '/api/proofs')['jobs'], [])
         self.assertEqual(self.ok('GET', '/api/task')['queue'], [])
 
@@ -209,7 +215,8 @@ class AssistantGuiTests(GuiCase):
         self.assertEqual(detail['assistant_budget']['tokens']['used'], 8 + 53 + 31 + 27)
         self.assertEqual(self.ok('GET', '/api/task')['queue'], [])
 
-    def test_poincare_proof_promotes_shared_budget_and_continues_after_full_cutoff(self):
+    def test_poincare_proof_promotes_time_and_retains_worker_budget_after_full_cutoff(self):
+        self.openai_fixture()
         self.hub.args.proof_solve_tokens = 32768
         self.hub.args.proof_verify_tokens = 16384
         chat = self.conversation()
@@ -218,13 +225,13 @@ class AssistantGuiTests(GuiCase):
         self.fake.replies = [delegation('prove', 'Prove the exact original statement.', effort='poincare'),
                              cutoff, text(PROOF, eval_count=20000),
                              text(json.dumps(APPROVAL), eval_count=8000), text('The written proof was reviewed.')]
-        original = 'Let G=-d_x^2-x^2*d_y^2 on (-1,1) x S^1. Show non-observability for T<a^2/2.'
+        original = 'Use maximum effort. Let G=-d_x^2-x^2*d_y^2 on (-1,1) x S^1. Show non-observability for T<a^2/2.'
         self.ask(chat, original)
         self.wait_task(timeout=30)
         saved = store.load_chat(self.root, chat)['assistant_state']
         self.assertEqual(saved['status'], 'complete', saved['warnings'])
-        self.assertEqual(saved['budget']['max_tokens'], 200000)
-        self.assertEqual(saved['budget']['max_input_tokens'], 800000)
+        self.assertIsNone(saved['budget']['max_tokens'])
+        self.assertIsNone(saved['budget']['max_input_tokens'])
         self.assertEqual(saved['budget']['max_seconds'], 7200)
         [child] = saved['children']
         proof = self.ok('GET', f'/api/proofs/{child["job_id"]}')
@@ -232,7 +239,7 @@ class AssistantGuiTests(GuiCase):
         self.assertEqual(proof['status'], 'candidate_complete')
         self.assertEqual(state['rounds_started'], 2)
         self.assertEqual(state['settings']['max_rounds'], 10)
-        self.assertEqual(state['settings']['max_tokens'], 200000 - 8 - 2 * 8192)
+        self.assertIsNone(state['settings']['max_tokens'])
         self.assertIn(original, state['goal'])
         self.assertIn('ORIGINAL USER REQUEST is authoritative', state['goal'])
         self.assertEqual(saved['budget']['tokens'], 8 + 32768 + 20000 + 8000 + 20)
@@ -244,7 +251,7 @@ class AssistantGuiTests(GuiCase):
         chat = self.conversation()
         self.fake.replies = [delegation('prove', 'Prove identity.', effort='poincare'),
                              text(PROOF), text(json.dumps(APPROVAL)), text('The proof is complete.')]
-        self.ask(chat, 'Prove x=x.')
+        self.ask(chat, 'Use maximum effort to prove x=x.')
         self.wait_task(timeout=30)
         saved = store.load_chat(self.root, chat)['assistant_state']
         self.assertEqual(saved['status'], 'complete')
@@ -252,19 +259,18 @@ class AssistantGuiTests(GuiCase):
                          (60000, 240000, 900))
         self.assertNotIn('adaptive_limits', saved['budget'])
 
-    def test_mixed_parallel_efforts_receive_proportional_shares(self):
+    def test_mixed_parallel_efforts_default_to_no_cumulative_ceiling(self):
         self.openai_fixture()
         chat = self.conversation()
         tasks = delegation('critic', 'Check one sign.', effort='low')
         tasks[0]['message']['tool_calls'] += delegation('explore', 'Work through the harder argument.', effort='poincare')[0]['message']['tool_calls']
         self.fake.replies = [tasks, text('Sign checked.'), text('Exploration finished.'), text('Both findings are retained.')]
-        self.ask(chat, 'Run these two independent tasks.')
+        self.ask(chat, 'Run these two independent tasks with maximum effort for the harder one.')
         self.wait_task(timeout=30)
         saved = store.load_chat(self.root, chat)['assistant_state']
         self.assertEqual(saved['status'], 'complete')
         low, poincare = saved['children']
-        self.assertGreater(poincare['allocation'], 6 * low['allocation'])
-        self.assertLessEqual(low['allocation'] + poincare['allocation'], 200000 - 8 - 2 * 8192)
+        self.assertEqual((low['allocation'], poincare['allocation']), (None, None))
 
     def test_two_independent_workers_use_parallel_calls_and_one_shared_budget(self):
         self.openai_fixture()

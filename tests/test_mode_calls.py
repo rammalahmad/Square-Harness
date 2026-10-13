@@ -132,9 +132,13 @@ class ReviewModeCallGuiTests(GuiCase):
 
 
 class ReviewEffortTests(unittest.TestCase):
-    def test_a_detailed_review_worker_gets_twice_the_budget(self):
+    def test_detailed_review_keeps_legacy_estimates_but_explicit_caps_are_not_multiplied(self):
         from mathagent.gui import effort
         plain, detailed = effort.level('referee', 'high'), effort.level('detailed_review', 'high')
         self.assertEqual((detailed['tokens'], detailed['input'], detailed['minutes']),
                          (2 * plain['tokens'], 2 * plain['input'], 2 * plain['minutes']))
         self.assertEqual(plain, effort.EFFORTS['high'])
+        from types import SimpleNamespace
+        args = SimpleNamespace(research_tokens=12000, research_input_tokens=50000)
+        caps = effort.limits('detailed_review', 'high', args)
+        self.assertEqual((caps['tokens'], caps['input_tokens'], caps['seconds']), (12000, 50000, 3600))

@@ -4,24 +4,23 @@ import type { Defaults } from './api'
 export type EffortKind = 'proof' | 'research' | 'writeup'
 export type EffortLevel = 'low' | 'medium' | 'high' | 'xhigh' | 'poincare'
 
-// The same budgets for every kind of job. Tries are proof attempts or investigation
-// rounds; tokens are generated tokens, thinking included. Reports also get input
-// tokens (every call's context counts again), web requests and evidence characters.
+// Effort sets checking depth, attempts, and time. Token estimates remain in this
+// table for older integrations; they are not cumulative limits for new work.
 export const EFFORTS: {
   id: EffortLevel; label: string; hint: string
   tries: number; minutes: number; tokens: number; input: number; requests: number; chars: number
 }[] = [
   { id: 'low', label: 'Low', hint: 'One quick try', tries: 1, minutes: 1, tokens: 30_000, input: 120_000, requests: 20, chars: 15_000 },
-  { id: 'medium', label: 'Medium', hint: 'Three tries, the usual choice', tries: 3, minutes: 15, tokens: 60_000, input: 240_000, requests: 50, chars: 30_000 },
-  { id: 'high', label: 'High', hint: 'Five tries for harder work', tries: 5, minutes: 30, tokens: 100_000, input: 400_000, requests: 80, chars: 60_000 },
-  { id: 'xhigh', label: 'Extra high', hint: 'Seven tries, up to an hour', tries: 7, minutes: 60, tokens: 150_000, input: 600_000, requests: 120, chars: 100_000 },
-  { id: 'poincare', label: 'Poincaré', hint: 'Ten tries, up to two hours, in honour of Henri Poincaré', tries: 10, minutes: 120, tokens: 200_000, input: 800_000, requests: 160, chars: 150_000 },
+  { id: 'medium', label: 'Medium', hint: 'Several passes with independent checks', tries: 3, minutes: 15, tokens: 60_000, input: 240_000, requests: 50, chars: 30_000 },
+  { id: 'high', label: 'High', hint: 'Deeper checking and more approaches', tries: 5, minutes: 30, tokens: 100_000, input: 400_000, requests: 80, chars: 60_000 },
+  { id: 'xhigh', label: 'Extra high', hint: 'Thorough checking and alternative approaches', tries: 7, minutes: 60, tokens: 150_000, input: 600_000, requests: 120, chars: 100_000 },
+  { id: 'poincare', label: 'Poincaré', hint: 'The deepest investigation, in honour of Henri Poincaré', tries: 10, minutes: 120, tokens: 200_000, input: 800_000, requests: 160, chars: 150_000 },
 ]
 
 export const LEVELS = EFFORTS.map((effort) => effort.id)
 
 export type Limits = {
-  rounds?: number; tokens: number; seconds: number; input_tokens?: number; requests?: number; chars?: number
+  rounds?: number; tokens: number | null; seconds: number; input_tokens?: number | null; requests?: number; chars?: number
   solve_tokens?: number; verify_tokens?: number
 }
 
@@ -32,22 +31,22 @@ export function isLevel(value: unknown): value is EffortLevel {
 }
 
 /** A proof needs room for one full solve and its review: fit the per-call ceilings in the budget. */
-function proofCeilings(defaults: Defaults, tokens: number) {
+function proofCeilings(defaults: Defaults, tokens: number | null) {
   const solve = defaults.proof_solve_tokens
   const verify = defaults.proof_verify_tokens
-  if (tokens >= solve + verify) return { tokens, solve_tokens: solve, verify_tokens: verify }
+  if (tokens === null || tokens >= solve + verify) return { tokens, solve_tokens: solve, verify_tokens: verify }
   // Launch floors for repairs stay valid: the solve ceiling never goes below them.
   const floor = Math.max(128, defaults.proof_repair_tokens ?? 0, defaults.proof_min_solve_tokens ?? 0)
   const fitted = Math.min(solve, Math.max(floor, Math.floor((tokens * solve) / (solve + verify))))
   const review = Math.min(verify, Math.max(128, tokens - fitted))
-  return { tokens: Math.max(tokens, fitted + review), solve_tokens: fitted, verify_tokens: review }
+  return { tokens, solve_tokens: fitted, verify_tokens: review }
 }
 
 export function effortLimits(kind: EffortKind, defaults: Defaults, level: EffortLevel): Limits {
   const effort = EFFORTS.find((item) => item.id === level) || EFFORTS[1]
   const seconds = effort.minutes * 60
-  if (kind === 'proof') return { rounds: effort.tries, seconds, ...proofCeilings(defaults, effort.tokens) }
-  const base: Limits = { tokens: effort.tokens, input_tokens: effort.input, seconds }
+  if (kind === 'proof') return { rounds: effort.tries, seconds, ...proofCeilings(defaults, defaults.proof_tokens) }
+  const base: Limits = { tokens: defaults.research_tokens, input_tokens: defaults.research_input_tokens, seconds }
   if (kind === 'writeup') return base
   return { ...base, rounds: effort.tries, requests: effort.requests, chars: effort.chars }
 }
@@ -60,7 +59,9 @@ export function minutesLabel(seconds: number) {
 
 export function describeLimits(kind: EffortKind, limits: Limits) {
   const tries = (n: number, one: string) => `${count(n)} ${n === 1 ? one : one + 's'}`
-  if (kind === 'proof') return `Up to ${tries(limits.rounds!, 'attempt')}, ${count(limits.tokens)} tokens and ${minutesLabel(limits.seconds)}`
-  if (kind === 'writeup') return `Up to ${count(limits.tokens)} generated tokens and ${minutesLabel(limits.seconds)}`
-  return `Up to ${tries(limits.rounds!, 'round')}, ${count(limits.tokens)} generated tokens, ${count(limits.requests!)} web requests and ${minutesLabel(limits.seconds)}`
+  const tokenCap = limits.tokens === null ? '' : `; output capped at ${count(limits.tokens)} tokens`
+  if (kind === 'proof') return `Up to ${tries(limits.rounds!, 'attempt')} with independent review; ${minutesLabel(limits.seconds)} working time${tokenCap}`
+  if (kind === 'writeup') return `Section-by-section writing and a fidelity check; ${minutesLabel(limits.seconds)} working time${tokenCap}`
+  const depth = EFFORTS.find((effort) => effort.tries === limits.rounds)?.label || 'Custom'
+  return `Checking depth: ${depth}; ${minutesLabel(limits.seconds)} working time${tokenCap}`
 }

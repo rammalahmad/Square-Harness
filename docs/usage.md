@@ -62,27 +62,32 @@ including agreement after repair, is not a formal proof certificate.
 | `--ctx` | 40,960 | Per-request context, including input and generated output |
 | `--proof-solve-tokens` | 32,768 | Maximum generated tokens for a solve or repair |
 | `--proof-verify-tokens` | 16,384 | Maximum generated tokens for one verification |
-| `--proof-tokens` | 120,000 | Generated-token ceiling for the entire job |
+| `--proof-tokens` | no cumulative cap | Optional generated-token ceiling for the entire job |
 | `--proof-rounds` | 3 | Maximum solver attempts, including the first |
 | `--proof-seconds` | 1,800 | Active job time allowance in seconds |
 | `--proof-repair-tokens` | solve tokens | Maximum generated tokens for each repair or later attempt |
-| `--proof-min-solve-tokens` | min(16,384, solve) | Smallest context-fitted repair/continuation allowance |
+| `--proof-min-solve-tokens` | 128 for new jobs | Smallest context-fitted repair/continuation allowance |
 | `--proof-verify-temperature` | `--temperature` | Verifier sampling temperature |
 | `--request-timeout` | 1,800 | Maximum seconds for a single request |
+| `--specialist-output-tokens` | phase and available context | Optional output cap per specialist call |
 
-Output ceilings **include thinking**. A 120k job allowance spans several requests;
-it does not require a 120k context. Limits are ceilings, not spending targets.
-The controller reserves room for the next useful operation and its review,
-and stops when that operation cannot fit in the remaining budget. After the first
+Output ceilings **include thinking**. New jobs have no cumulative token cap unless
+you set one. A cumulative cap spans several requests; it does not determine the
+context size of any one request. Explicit caps are ceilings, not spending targets,
+and stay with a saved job on resume. The controller reserves room for the next
+useful operation and its review when a cumulative cap is set. After the first
 solve and review, their measured duration must also fit in the remaining time
-before another attempt starts. With the defaults this usually allows one repair.
+before another attempt starts. Attempts, working time and request timeouts remain
+finite even when cumulative token usage is uncapped.
 
 These are starting settings, not experimentally established optima. A long
 candidate plus a long verifier response must fit within the same context window.
-The first solve keeps its full allowance, exactly like direct inference. A repair
-or continuation may use a smaller output allowance so that its full input fits,
-but never less than `--proof-min-solve-tokens`; below that it is an explicit
-context failure. Prompts are never shortened invisibly.
+Each call's output allowance is fitted after counting its actual request,
+including sources and tool schemas, and leaving room for response framing.
+The configured context is also limited by the server capacity when the adapter
+can discover it. A repair or continuation must retain at least
+`--proof-min-solve-tokens`; below that it is an explicit context failure.
+Hypotheses and essential source passages are never shortened invisibly.
 The llama.cpp adapter and supported vLLM `/tokenize` endpoints provide exact input
 counts; otherwise a conservative byte estimate can reject a request that would fit.
 Choose budgets to suit the server and keep enough room for both the problem and
@@ -98,7 +103,10 @@ square-harness --workspace ~/research/smoke --ctx 16384 \
 This checks operation, not mathematical quality. A smaller allowance changes the
 experiment and may be insufficient for a harder problem.
 
-`--predict` controls ordinary chat, not proof solving. `--no-think` and `/think off`
+`--predict` controls ordinary chat. Specialist work uses its phase's allowance,
+the available context, and any explicit `--specialist-output-tokens` cap;
+the ordinary-chat value is not a hidden ceiling on a proof or explanation.
+`--no-think` and `/think off`
 apply to chat; proof mode always requests thinking. `--show-thinking` changes only
 the terminal display. Backend support for reasoning must be verified separately.
 
@@ -228,25 +236,31 @@ citation checks) can slide away to a thin spine: use the panel icon at the top
 of each, and click the spine to bring it back. The choice is remembered by the
 browser; when the side panel is hidden, its content is a tab of the page.
 
-New proofs, reports and write-ups take an **effort**. Each level is a fixed budget:
+New proofs, reports and write-ups take an **effort**. It sets checking depth,
+the range of approaches and working time, without imposing a cumulative token cap:
 
-| Effort | Attempts or rounds | Time | Generated tokens | Input tokens (reports) | Web requests |
-| --- | --- | --- | --- | --- | --- |
-| Low | 1 | 1 min | 30,000 | 120,000 | 4 |
-| Medium | 3 | 15 min | 60,000 | 240,000 | 12 |
-| High | 5 | 30 min | 100,000 | 400,000 | 24 |
-| Extra high | 7 | 1 h | 150,000 | 600,000 | 40 |
-| Poincaré | 10 | 2 h | 200,000 | 800,000 | 60 |
+| Effort | Proof attempts / research rounds | Working time | Retrieval requests |
+| --- | --- | --- | --- |
+| Low | 1 | 1 min | 20 |
+| Medium | 3 | 15 min | 50 |
+| High | 5 | 30 min | 80 |
+| Extra high | 7 | 1 h | 120 |
+| Poincaré | 10 | 2 h | 160 |
 
-A proof attempt reserves one solve and one review (`--proof-solve-tokens` and
-`--proof-verify-tokens`); when a level's tokens cannot hold both, the form lowers
-these two ceilings in proportion, so every level can make at least one full
-attempt. The attempts are a maximum: a job also stops when its tokens or time
-run out. Write-ups have no rounds. The summary under the slider states the exact
-limits, and Advanced limits lets you edit them, including a proof's solve and
-review output ceilings and its context. The Poincaré effort, named after Henri
-Poincaré, can run for two hours; pause it whenever you like. The `--proof-*` and
-`--research-*` budget flags keep applying to the terminal and to the API.
+Review variants translate the level into their own passes and dependency depth;
+the table's rounds are not a count of independently verified theorems. Document
+work follows a finite saved plan of reading parts, proof checks, explanation
+parts or sections. A partial result identifies unfinished or unusable parts.
+Reading coverage records source lines supplied to the model, not comprehension
+or mathematical validity. Write-ups have no investigation rounds.
+
+Advanced limits lets you set optional total output and input caps, a proof's
+per-call solve and review allowances, and its context. Explicit launch caps still
+apply. Detailed review allows twice the working time of Review; it does not
+silently double an explicit token cap. A proof attempt needs room for a solve
+and review, so a small explicit total cap can require smaller per-call allowances.
+Pause saves the work. Resume keeps the original settings and usage, including
+numeric caps in older saved jobs.
 
 A proof started in the interface is the same job as `/prove`: the model sees the
 statement and the pinned files only, with thinking on and no tools. The form warns
@@ -257,8 +271,8 @@ Every job page also lists its saved files: exact request payloads, streamed
 answers and intermediate results. Pause stops model work at the next checkpoint,
 like Ctrl+C in the terminal; Resume continues with the remaining saved budget.
 The interface allows two active conversations or standalone jobs by default.
-Each keeps its full generated-token, input-token and time allowance. Two chats
-with 60,000 generated tokens each can therefore spend 120,000 tokens in total.
+Each has its own usage accounting and working-time allowance; an explicit cap
+on one conversation does not limit another.
 Only one pending turn can write to each conversation, and a saved job cannot
 be resumed twice concurrently. Pause controls always select one particular task.
 An Assistant turn can include several focused workers within its active slot;
@@ -276,14 +290,23 @@ concurrent inference sequences to generate both streams at once. This shares
 generation capacity and does not impose an artificial token/s cap or guarantee
 an exact 50/50 speed split. Time ceilings still count wall-clock time while a
 task is active. Queued tasks do not spend their active-time budget.
-The Assistant starts with 60,000 generated tokens, 240,000 input tokens and
-15 minutes. Its default allowance grows to the highest delegated effort, up to
-Poincaré's 200,000 tokens, 800,000 input tokens and two hours. Parallel workers
-share the remaining generated tokens in proportion to their effort, with room
-reserved for the final answer. Explicit `--assistant-tokens`,
-`--assistant-input-tokens` and `--assistant-seconds` values are hard caps and are
-never raised. Resume keeps the saved ceilings and spent allowance. Ten proof
-attempts is an upper bound, subject to the actual tokens and time remaining.
+New Assistant turns and focused jobs have no cumulative generated- or input-token
+ceiling by default. Per-request context and output limits still apply. Focused
+workers retain finite plans, checking depth and working-time allowances. Active time starts at 15 minutes
+and adapts to the highest delegated effort, up to two hours. Explicit
+`--assistant-tokens`, `--assistant-input-tokens` and `--assistant-seconds`
+values are hard caps and are never raised. Parallel workers share an explicitly
+limited allowance, with room reserved for the final answer. Resume keeps the
+saved ceilings and spent allowance, including older adaptive token ceilings.
+The **Output** counter shows settled charged usage, including thinking;
+temporary reservations for calls in progress appear separately. The settled
+counter therefore does not jump by the full reservation when a new call starts.
+**Cumulative input tokens** sums input across calls, including repeated source
+passages. **Current input context**, when a per-call measurement is available,
+shows that call's input against its context capacity; its output shares the same
+capacity. It is not inferred from cumulative usage. If a stream ends without
+reported usage, its reserved allowance remains conservatively charged.
+Proof attempts remain an upper bound, subject to working time and any explicit cap.
 A job started when all active slots are occupied, from a form, a suggestion or a
 Resume button, waits in the queue, where it can be cancelled. It starts when a
 slot becomes available. Approval dialogs replace the terminal's `[y/N]`
@@ -295,6 +318,19 @@ critique and exploration chat, a turn that is paused or fails never enters the
 model's context; the interface keeps it visible and marks it as discarded. Critique and
 exploration conversations made by earlier versions of the interface stay listed
 in the Assistant notebook and can be continued.
+
+Requests for an attached article's main results or contribution automatically
+use an exploration worker with a source index and selected, numbered excerpts.
+The worker synthesizes those excerpts and identifies partial coverage and missing passages;
+the packet does not replace the full-source pipelines used by Review or Explain.
+An explanation of a named theorem uses Explain. A follow-up such as “Explain
+Theorem 1” can reuse the most recent user attachment when there is only one
+possible source. New attachments and explicitly named files take precedence.
+If several previous attachments could match a singular request, the harness asks
+which one; unrelated messages do not automatically inherit files. Explicit `@`
+selections take precedence. Empty final responses receive one final-answer recovery from saved
+evidence; a repeated empty answer is reported as a failure instead of offering
+an ineffective Resume loop.
 
 ### Folders and file access
 
@@ -400,28 +436,31 @@ review, and a model review remains a model opinion.
 
 Research, review and write-up workers receive the delegated objective separately
 from an exact saved copy of the conversation and its source context (a reading
-list uses it to set its scope). The
-20,000-character objective limit therefore does not apply to a long prior
-report. Context must still fit the model window; essential reference context is
-never silently shortened. Permanent input or permission failures are saved
+list uses it to set its scope). The 20,000-character objective limit therefore
+does not apply to a long prior report. Each call uses the relevant exact source
+passages. Bulky earlier tool output can be replaced in that call by an explicit
+pointer to its saved copy; omitted output is not assumed as a mathematical fact.
+User constraints and essential source dependencies must still fit the model
+window, or the worker reports the missing capacity. Permanent input or permission failures are saved
 and block another launch with unchanged context, even if the assistant
 paraphrases the request or raises its effort. Other available capabilities may
 still be used. If a repeated blocked action is attempted, the next response must
 finish with the evidence and limitations already available.
 
-The assistant and its tasks share one generated-token and active-time allowance.
+The assistant and its tasks share usage accounting, active time, and any explicit
+cumulative token allowance.
 The assistant's own calls run without thinking; delegated tasks use the effort
 chosen for their work. Reaching a budget or context limit
 retains partial work and its status. The standalone Prove notebook and terminal
 proof baseline retain their existing solve, review and repair workflow.
 
-The assistant's answers, direct or after a worker returns, have an output
-ceiling of 8,192 tokens.
-If the assistant's answer reaches its ceiling, Resume requests a complete
-replacement using the saved results, without rerunning completed workers.
-Its ceiling can grow to 16,384 tokens, within the remaining shared budget and
-context space. The unfinished fragment is retained for inspection rather than
-used as a proved premise.
+The assistant starts an answer with a phase allowance of 8,192 output tokens,
+fitted to the actual request and available context. A truncated final answer can
+be replaced from saved findings with a larger allowance when context and any
+explicit cap permit it. Recovery is bounded and does not repeat the same output
+ceiling after a length failure. Completed workers are not rerun
+for this recovery. The unfinished fragment remains available for inspection
+and is not used as a proved premise.
 
 For an OpenAI-compatible backend such as vLLM, `--assistant-concurrency` sets the
 maximum number of simultaneous tasks, from 1 to 4 (default 2). Tasks that depend
@@ -430,13 +469,17 @@ of 1. All tasks use the same served model and reserve part of the parent budget;
 concurrency does not multiply that budget or guarantee a speedup. Set the limit
 to 1 to serialize inference, and measure the actual server before increasing it.
 
-The shared ceilings can be fixed at launch with `--assistant-tokens`,
-`--assistant-input-tokens`, and `--assistant-seconds`; otherwise they adapt to
-worker effort as described above. A new turn can create at most four workers and
-use at most twelve tool actions. Saved turns retain their original limits across
-pause and resume. At the action limit the assistant must give an answer from
-saved evidence, including unconfirmed details. A reply that only promises another
-lookup gets one recovery call; a repeated promise remains incomplete and resumable.
+Optional shared caps can be fixed at launch with `--assistant-tokens`,
+`--assistant-input-tokens`, and `--assistant-seconds`. New Assistant turns have
+no fixed twelve-action ceiling or fixed total worker count. Identical operations
+on unchanged sources reuse saved results, repeated permanent failures are
+blocked, and repeated operations without usable new findings lead to synthesis
+from the available evidence. Workers cannot create recursive worker trees.
+These checks reduce loops; they do not certify useful mathematical progress.
+Working time and per-request timeouts still prevent unbounded unattended work.
+Saved turns retain their original limits across pause and resume, including
+older action ceilings. A reply that only promises another lookup gets one
+recovery call; a repeated promise remains incomplete and resumable.
 
 Use **Pause**, or **Pause assistant** on the current task's card, to stop at a
 checkpoint. **Resume assistant** continues the saved turn with its remaining

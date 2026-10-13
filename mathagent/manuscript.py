@@ -373,9 +373,10 @@ def _parse_text(lines, fmt):
             unit = _unit(word, name, num, '', title, number,
                          section, appendix or bool(re.match(r'[A-Z]\.', num)))
             end = next_boundary(number) - 1
-            unit['statement'] = [number, max(number, min(end, number + 59))]
-            if end > number + 59:
-                result['warnings'].append(f'{unit["name"]}: statement end not found; first 60 lines kept.')
+            # Extracted PDFs can put each symbol on a separate line. Preserve
+            # the full statement to its detected boundary, including all late
+            # hypotheses; the request allocator handles large exact packets.
+            unit['statement'] = [number, max(number, end)]
             units.append(unit)
             continue
         # a proof
@@ -413,7 +414,7 @@ def _parse_text(lines, fmt):
             unit['equations'] += _text_equations(lines, '\n'.join(lines[a - 1:b]), a, b)
         unit['refs'] = list(dict.fromkeys(unit['refs']))
         unit['statement_refs'] = list(dict.fromkeys(unit['statement_refs']))
-        unit['equations'] = [list(r) for r in dict.fromkeys(tuple(r) for r in unit['equations'])][:12]
+        unit['equations'] = [list(r) for r in dict.fromkeys(tuple(r) for r in unit['equations'])]
     if not units:
         result['warnings'].append('No numbered statements or proofs were recognised; the review falls back to fixed-size chunks.')
     result['units'] = units

@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react'
 import { api, type Call, type Candidate, type Pending, type ProofDetail, type Review } from '../api'
-import { Collapse, ErrorNote, Loading, Meter, SourceLines, Tabs, useLoad } from '../components/common'
+import { Collapse, ErrorNote, Loading, Meter, SourceLines, Tabs, UsageMeters, WorkProgressNote, useLoad } from '../components/common'
 import { PauseIcon, PlayIcon } from '../components/Icons'
 import { Inline, Markdown } from '../components/Markdown'
 import { candidateLook, proofLook, proofResumable, Square, type Variant } from '../components/Square'
@@ -112,6 +112,7 @@ function ProofHeader({ data, ours, pausing }: { data: ProofDetail; ours: boolean
         {data.legacy && <span>v0.4 engine</span>}
         <span>Started {ago(data.created_at)}</span>
       </div>
+      <WorkProgressNote progress={data.progress} status={data.status} running={data.running} />
       {data.legacy && (
         <p className="warning-note">
           This proof was made by the earlier v0.4 engine. Its report, sources and files stay readable here, but v0.5 cannot
@@ -126,7 +127,7 @@ function ProofHeader({ data, ours, pausing }: { data: ProofDetail; ours: boolean
           </button>
         ) : resumable ? (
           <button type="button" className="btn btn-primary" disabled={queued} onClick={() => act(api.resumeProof(data.id, true))}>
-            <PlayIcon size={16} /> {queued ? 'Waiting in the queue' : busy ? 'Queue resume' : 'Resume with the remaining budget'}
+            <PlayIcon size={16} /> {queued ? 'Waiting in the queue' : busy ? 'Queue resume' : 'Resume saved work'}
           </button>
         ) : null}
         {data.running && !ours && <span className="muted">Running in another process, such as a terminal.</span>}
@@ -339,10 +340,9 @@ function Overview({ data, onAttempt }: { data: ProofDetail; onAttempt: (index: n
   return (
     <div className="ledger">
       <section className="aside-section">
-        <h3 className="aside-title">Budget</h3>
+        <h3 className="aside-title">Usage</h3>
         <Meter label={data.legacy ? 'Rounds' : 'Attempts'} used={b.rounds.used} limit={b.rounds.limit} />
-        <Meter label="Generated tokens" used={b.tokens.used} limit={b.tokens.limit} />
-        <Meter label="Time, minutes" used={b.seconds.used / 60} limit={b.seconds.limit / 60} decimals={1} />
+        <UsageMeters budget={b} />
         {!data.legacy && settings.max_predict !== undefined && (
           <p className="muted small">
             Each solve reserves {count(settings.max_predict)} tokens{settings.repair_tokens !== undefined && settings.repair_tokens !== settings.max_predict ? `, each repair ${count(settings.repair_tokens)}` : ''}

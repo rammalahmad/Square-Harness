@@ -223,7 +223,7 @@ class LegacyRouteTests(GuiCase):
         from mathagent.gui import effort
         self.assertEqual(effort.limits('explain', 'low', self.hub.args)['rounds'], 1)
         plain, detailed = effort.limits('referee', 'high', self.hub.args), effort.limits('detailed_review', 'high', self.hub.args)
-        self.assertEqual((detailed['tokens'], detailed['seconds']), (2 * plain['tokens'], 2 * plain['seconds']))
+        self.assertEqual((detailed['tokens'], detailed['seconds']), (plain['tokens'], 2 * plain['seconds']))
 
     def test_forms_and_resumes_queue_behind_a_running_job(self):
         blocker = self.ok('POST', '/api/chats', {'mode': 'critic'})['id']
@@ -264,7 +264,8 @@ class WriteupTests(GuiCase):
         (self.root / 'mymacros.sty').write_text('\\newcommand{\\R}{\\mathbb{R}}\n\\newtheorem{lemma}{Lemma}\n')
 
     def replies(self):
-        return [text(json.dumps(OUTLINE)), text(SECTION_ONE), text(SECTION_TWO), text('Faithful; one TODO remains.')]
+        return [text(json.dumps(OUTLINE)), text(SECTION_ONE), text(SECTION_TWO),
+                text('Setting is faithful.'), text('Main result is faithful; one TODO remains.')]
 
     def test_write_up_without_latex_is_exported_and_traced(self):
         self.fake.replies = self.replies()
@@ -291,10 +292,13 @@ class WriteupTests(GuiCase):
         self.assertIn('\\newcommand{\\R}{\\mathbb{R}}', plan_request['messages'][1]['content'])
         self.assertIn('M1 L3: embedding H^1 -> L^2 compact', self.fake.requests[2]['messages'][1]['content'])
         self.assertEqual(self.request('GET', f'/api/research/{started["id"]}/pdf')[0], 404)
-        review = self.fake.requests[3]['messages'][1]['content']
-        self.assertIn('WRITE-UP TO REVIEW:', review)
-        self.assertTrue(review.rstrip().endswith('Do not reproduce the document.'))
-        self.assertIn('\\begin{lemma}', review)
+        reviews = [request['messages'][1]['content'] for request in self.fake.requests[3:]]
+        self.assertEqual(len(reviews), 2)  # the complete source for each section gets its own fidelity pass
+        self.assertTrue(all('WRITE-UP TO REVIEW:' in review for review in reviews))
+        self.assertTrue(all(review.rstrip().endswith('Do not reproduce the document.') for review in reviews))
+        self.assertIn('\\begin{lemma}', reviews[1])
+        self.assertIn('M1 L3:', reviews[1])
+        self.assertTrue(detail['review_complete'])
         self.assertNotIn('review_context_issues', {k for k, v in detail.items() if v})
 
     def test_existing_output_is_never_replaced_and_inputs_are_checked(self):
@@ -329,7 +333,8 @@ class WriteupTests(GuiCase):
         self.assertIn('\\usepackage{mymacros}', detail['document'])
 
     def test_a_review_that_copies_the_document_does_not_count(self):
-        self.fake.replies = self.replies()[:-1] + [text('\\documentclass{amsart}\n\\begin{document}copied\\end{document}')]
+        copied = text('\\documentclass{amsart}\n\\begin{document}copied\\end{document}')
+        self.fake.replies = self.replies()[:3] + [copied, copied]
         with patch('mathagent.writeup.shutil.which', return_value=None):
             started = self.ok('POST', '/api/writeup', {'goal': 'Write up.', 'source_files': ['notes.md'], 'tokens': 12000})
             self.wait_task(timeout=30)
@@ -341,7 +346,7 @@ class WriteupTests(GuiCase):
     def test_compiles_with_the_template_macros_and_repairs_errors(self):
         broken = SECTION_TWO.replace('\\end{lemma}', '\\end{lemma}\n\\undefinedmacro')
         self.fake.replies = [text(json.dumps(OUTLINE)), text(SECTION_ONE), text(broken),
-                             text(SECTION_TWO), text('Faithful.')]
+                             text(SECTION_TWO), text('Setting is faithful.'), text('Main result is faithful.')]
         started = self.ok('POST', '/api/writeup', {'goal': 'Write up.', 'source_files': ['notes.md'],
                                                    'template_files': ['mymacros.sty'], 'tokens': 16000, 'seconds': 240})
         self.assertEqual(self.wait_task(timeout=240)['state'], 'done')
@@ -382,7 +387,7 @@ if __name__ == '__main__':
 
 
 class EffortTableTests(unittest.TestCase):
-    def test_saved_maximum_effort_routes_keep_their_budgets(self):
+    def test_saved_maximum_effort_routes_keep_their_depth_without_inventing_token_caps(self):
         from types import SimpleNamespace
         from mathagent.gui import effort
         args = SimpleNamespace(proof_solve_tokens=32768, proof_verify_tokens=16384,
@@ -411,13 +416,13 @@ class EffortTableTests(unittest.TestCase):
                 with self.subTest(status=item['status'], mode=item['mode']):
                     self.assertEqual(effort.LABELS[item['effort']], 'Poincaré')
                     limits = effort.limits(item['mode'], item['effort'], args)
-                    self.assertEqual((limits['seconds'], limits['tokens']), (7200, 200000))
+                    self.assertEqual((limits['seconds'], limits['tokens']), (7200, None))
                     if item['mode'] != 'writeup':
                         self.assertEqual(limits['rounds'], 10)
                     if item['mode'] == 'prove':
                         self.assertEqual((limits['solve_tokens'], limits['verify_tokens']), (32768, 16384))
                     else:
-                        self.assertEqual(limits['input_tokens'], 800000)
+                        self.assertIsNone(limits['input_tokens'])
                     if item['mode'] == 'referee':
                         self.assertEqual((limits['requests'], limits['chars']), (160, 150000))
 
@@ -438,13 +443,28 @@ class EffortTableTests(unittest.TestCase):
         from types import SimpleNamespace
         from mathagent.gui import effort
         args = SimpleNamespace(proof_solve_tokens=32768, proof_verify_tokens=16384,
-                               proof_repair_tokens=None, proof_min_solve_tokens=None)
+                               proof_repair_tokens=None, proof_min_solve_tokens=None, proof_tokens=30000)
         low = effort.limits('prove', 'low', args)
         self.assertEqual((low['rounds'], low['seconds'], low['tokens']), (1, 60, 30000))
         self.assertLessEqual(low['solve_tokens'] + low['verify_tokens'], low['tokens'])
+        args.proof_tokens = None
         self.assertEqual(effort.limits('prove', 'medium', args)['solve_tokens'], 32768)
+        self.assertIsNone(effort.limits('prove', 'medium', args)['tokens'])
         self.assertEqual(effort.limits('referee', 'poincare', args)['seconds'], 7200)
         self.assertEqual(effort.limits('critic', 'high', args), {})
+
+    def test_explicit_launch_caps_are_preserved_for_every_effort_and_review_variant(self):
+        from types import SimpleNamespace
+        from mathagent.gui import effort
+        args = SimpleNamespace(proof_solve_tokens=32768, proof_verify_tokens=16384,
+                               proof_repair_tokens=None, proof_min_solve_tokens=None,
+                               proof_tokens=90000, research_tokens=24000, research_input_tokens=100000)
+        for level in effort.EFFORTS:
+            with self.subTest(level=level):
+                self.assertEqual(effort.limits('prove', level, args)['tokens'], 90000)
+                for mode in ('literature', 'referee', 'quick_review', 'detailed_review', 'explain', 'writeup'):
+                    limits = effort.limits(mode, level, args)
+                    self.assertEqual((limits['tokens'], limits['input_tokens']), (24000, 100000))
 
 
 class OnlineAndEffortTests(GuiCase):

@@ -12,7 +12,8 @@ from mathagent.ledger import LedgerError, ProofStore
 from types import SimpleNamespace
 
 from mathagent import benchmark
-from mathagent.proof import ProofBudget, ProofRunner, check_context, count_input, validate_review
+from mathagent.proof import (LEGACY_CONTROLLER_SHA256, LEGACY_TRANSPORT_SHA256,
+                             ProofBudget, ProofRunner, check_context, count_input, validate_review)
 from mathagent.proof_policy import COMMON_INSTRUCTION, initial_request
 from mathagent.tools import Workspace
 
@@ -75,6 +76,108 @@ class ProofV05Tests(unittest.TestCase):
         settings = dict(max_predict=512, verify_tokens=256, max_tokens=5000, max_rounds=3)
         settings.update(kwargs)
         return runner, runner.start('Prove x=x for every real x.', **settings)
+
+    def test_default_proof_has_no_cumulative_cap_and_preserves_finite_verification(self):
+        runner = self.runner([[event('Complete proof.', count=130000)], [event(approval(), count=15000)]])
+        runner.agent.ctx = 200000
+        result = runner.start('Prove x=x.', max_predict=150000, verify_tokens=16384)
+        self.assertEqual(result['status'], 'candidate_complete')
+        self.assertIsNone(runner.state['settings']['max_tokens'])
+        self.assertEqual(result['tokens_charged'], 145000)
+        self.assertEqual(len(runner.state['reviews']), 1)
+        self.assertIn('no cumulative limit', result['report'])
+        reloaded = ProofStore.load(self.root, result['id'])
+        self.assertIsNone(reloaded.state['settings']['max_tokens'])
+
+    def test_first_solver_and_whole_candidate_review_fit_actual_context(self):
+        runner = self.runner([[event('Complete proof.')], [event(approval())]])
+        runner.agent.ctx = 8192
+        runner.agent.client.count_input_tokens = lambda payload: 1000
+        result = runner.start('Prove x=x.')
+        self.assertEqual(result['status'], 'candidate_complete')
+        self.assertEqual([r['options']['num_predict'] for r in runner.agent.client.requests], [6680, 6680])
+        self.assertIn('Complete proof.', runner.agent.client.requests[1]['messages'][0]['content'])
+        allocation = runner.state['calls'][0]['context']
+        self.assertEqual((allocation['requested_output_tokens'], allocation['output_tokens']), (32768, 6680))
+
+    def test_explicit_useful_floor_is_not_lowered_to_fit_context(self):
+        runner = self.runner([])
+        runner.agent.ctx = 8192
+        runner.agent.client.count_input_tokens = lambda payload: 1000
+        result = runner.start('Prove x=x.', min_solve_tokens=8000)
+        self.assertEqual(result['status'], 'needs_context')
+        self.assertEqual(runner.agent.client.requests, [])
+
+    def test_explicit_specialist_override_is_distinct_from_ordinary_predict(self):
+        runner = self.runner([[event('Complete proof.')], [event(approval())]])
+        runner.agent.document_output_cap = 512
+        result = runner.start('Prove x=x.')
+        self.assertEqual(result['status'], 'candidate_complete')
+        self.assertEqual([r['options']['num_predict'] for r in runner.agent.client.requests], [512, 512])
+        self.assertEqual(runner.agent.predict, 77)
+
+    def test_small_context_continues_exact_work_without_an_implicit_16k_floor(self):
+        runner = self.runner([[event('Saved exact proof fragment.', reason='length')],
+                              [event('Completed proof.')], [event(approval())]])
+        runner.agent.ctx = 8192
+        runner.agent.client.count_input_tokens = lambda payload: 1000
+        result = runner.start('Prove x=x.')
+        self.assertEqual(result['status'], 'candidate_complete')
+        self.assertEqual(runner.state['settings']['min_solve_tokens'], 128)
+        self.assertIn('Saved exact proof fragment.', runner.agent.client.requests[1]['messages'][0]['content'])
+        self.assertEqual([r['options']['num_predict'] for r in runner.agent.client.requests], [6680, 6680, 6680])
+
+    def test_empty_length_failure_is_not_repeated_with_the_same_allowance(self):
+        runner = self.runner([[event('', reason='length')]])
+        result = runner.start('Prove x=x.')
+        self.assertEqual(result['status'], 'needs_context')
+        self.assertEqual(len(runner.agent.client.requests), 1)
+        self.assertIn('without reusable', result['stop_reason'])
+
+    def test_server_context_is_used_for_continuation_preflight_and_dispatch(self):
+        runner = self.runner([[event('Saved fragment.', reason='length')],
+                              [event('Complete proof.')], [event(approval())]])
+        def count(payload):
+            self.assertNotIn('num_ctx', payload['options'])
+            runner.agent.client.observed_context_tokens = 8192
+            return 1000
+        runner.agent.client.count_input_tokens = count
+        result = runner.start('Prove x=x.')
+        self.assertEqual(result['status'], 'candidate_complete')
+        self.assertTrue(all(r['options']['num_ctx'] == 8192 for r in runner.agent.client.requests))
+        self.assertEqual(runner.state['settings']['ctx'], 40960)
+
+    def test_compatible_saved_policy_migration_preserves_caps_and_charged_calls(self):
+        runner, paused = self.run_proof([KeyboardInterrupt(), [event('Complete proof.')], [event(approval())]])
+        saved = runner.state['settings']
+        saved['policy_version'] = 7
+        saved['controller_sha256'] = LEGACY_CONTROLLER_SHA256
+        saved['transport_sha256'] = copy.deepcopy(LEGACY_TRANSPORT_SHA256)
+        saved.pop('allocation_policy_sha256')
+        saved.pop('initial_min_solve_tokens')
+        saved.pop('specialist_output_cap')
+        runner.store.save()
+        charged = runner.state['tokens_charged']
+        result = runner.resume(paused['id'])
+        self.assertEqual(result['status'], 'candidate_complete')
+        self.assertEqual(runner.state['settings']['max_tokens'], 5000)
+        self.assertEqual(runner.state['settings']['controller_sha256'], LEGACY_CONTROLLER_SHA256)
+        self.assertEqual(runner.state['settings']['policy_version'], 7)
+        self.assertEqual(runner.state['execution_migration']['to_policy'], 8)
+        self.assertEqual(runner.state['execution_migration']['original_transport_sha256'], LEGACY_TRANSPORT_SHA256)
+        self.assertEqual(result['tokens_charged'], charged + 20)
+        self.assertEqual(len(runner.agent.client.requests), 3)
+
+    def test_policy_migration_does_not_authorize_unknown_transport_changes(self):
+        runner, paused = self.run_proof([KeyboardInterrupt()])
+        saved = runner.state['settings']
+        saved['policy_version'] = 7
+        saved['controller_sha256'] = LEGACY_CONTROLLER_SHA256
+        saved['transport_sha256'] = {**LEGACY_TRANSPORT_SHA256, 'backends.py': 'unrecognized-transport'}
+        runner.store.save()
+        with self.assertRaisesRegex(ValueError, 'unrecognized policy-7'):
+            runner.resume(paused['id'])
+        self.assertEqual(len(runner.agent.client.requests), 1)
 
     def test_first_solve_matches_direct_and_positive_explanation_stops(self):
         text = 'For every real x, equality is reflexive, hence x=x.\n'
@@ -381,7 +484,7 @@ class ProofV05Tests(unittest.TestCase):
 
     def test_conservative_context_fallback_and_exact_counter(self):
         client = Client([])
-        payload = {'messages': initial_request('x=x'), 'options': {'num_ctx': 1000, 'num_predict': 128}}
+        payload = {'messages': initial_request('x=x'), 'options': {'num_ctx': 4096, 'num_predict': 128}}
         self.assertEqual(check_context(client, payload)['method'], 'server token count')
         client.count_input_tokens = lambda payload: None
         self.assertIn('byte estimate', check_context(client, payload)['method'])
@@ -426,7 +529,7 @@ class ProofV051RealSizeTests(unittest.TestCase):
         self.assertEqual(initial['options']['num_predict'], 32768)  # the direct-call allowance is never fitted
         self.assertEqual(initial['messages'], initial_request('Prove the identity for every integer n >= 1.'))
         count = count_input(client, repair)[0]
-        self.assertEqual(repair['options']['num_predict'], min(32768, 40960 - count - 1))
+        self.assertEqual(repair['options']['num_predict'], min(32768, 40960 - count - 512))
         self.assertEqual(runner.state['calls'][2]['reserved_tokens'], repair['options']['num_predict'])
         return count, repair['options']['num_predict']
 
@@ -466,16 +569,15 @@ class ProofV051RealSizeTests(unittest.TestCase):
         self.assertLessEqual(count_input(client, request)[0] + cap + 1, 40960)
         self.assertEqual(runner.state['candidates'][1]['kind'], 'continue')
 
-    def test_unfittable_continuation_becomes_fresh_solve(self):
+    def test_unfittable_length_continuation_does_not_repeat_the_same_fresh_allowance(self):
         huge_fragment = 'fragment text ' * 9000
         client = ExactClient([[event(huge_fragment, thinking='notes', reason='length', count=32768)],
                               [event('Fresh complete proof.', count=20000)], [event(approval(), count=8000)]])
         runner, result = self.start(client)
-        self.assertEqual(client.requests[1]['messages'], initial_request('Prove the identity for every integer n >= 1.'))
-        self.assertEqual(client.requests[1]['options']['num_predict'], 32768)
-        self.assertEqual(runner.state['candidates'][1]['kind'], 'retry')
-        self.assertEqual(result['answer'], 'Fresh complete proof.')
-        self.assertEqual(result['status'], 'candidate_complete')
+        self.assertEqual(len(client.requests), 1)
+        self.assertEqual(result['answer'], huge_fragment)
+        self.assertEqual(result['status'], 'needs_context')
+        self.assertIn('same exhausted output allowance', result['stop_reason'])
 
     def test_verifier_is_sampled_and_framed_as_review(self):
         client = ExactClient([[event('A complete proof.', count=20000)], [event(approval(), count=8000)]])

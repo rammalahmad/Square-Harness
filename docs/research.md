@@ -17,8 +17,11 @@ read and search supported text files in the workspace (including `.sty` and
 Writes display a diff and require approval. Text excerpts are bounded; the model
 must not treat an excerpt as the whole manuscript.
 
-`--predict` bounds chat output including thinking; `--max-rounds` bounds tool
-rounds. `/think on|off` changes chat reasoning, and `/context N` changes the
+In ordinary terminal chat, `--predict` bounds output including thinking and
+`--max-rounds` bounds tool rounds. Specialist workflows allocate output for each
+phase after counting the complete request; they do not inherit the ordinary-chat
+output limit. An optional `--specialist-output-tokens` value caps each specialist
+call. `/think on|off` changes chat reasoning, and `/context N` changes the
 context allocation for new work. `/clear` clears chat history; `/save session.json`
 exports a transcript. Chat transcript import is not implemented.
 
@@ -67,6 +70,15 @@ and name the result for a quick review or an explanation); the Assistant can als
 them itself. In the terminal they are `/quick_review`, `/referee`, `/detailed_review` and
 `/explain`:
 
+An article overview, its main results or its authors' claimed contribution uses
+Explore, with a source index and selected exact excerpts. Explain handles one
+specified result and its proof. An overview must identify unread material and
+distinguish the authors' novelty claims from independently checked prior work.
+It is not a whole-paper proof audit. Explicit mode selections take precedence.
+For a follow-up about the same article, a single previous user attachment can
+be reused; a named file or new attachment takes precedence, and ambiguous
+multiple attachments require a source choice.
+
 - **Quick check** (`quick_review`): is this proof correct? Paste the statement and its
   proof, or pin a file and name the result (`Lemma 3.2`, a label such as `lem:compact`).
   Independent verifier passes read the proof through different lenses (line by line,
@@ -81,7 +93,8 @@ them itself. In the terminal they are `/quick_review`, `/referee`, `/detailed_re
   to the editor. The proofs are not checked. From a PDF, only comments on words and
   sentences are kept, since its formulas are garbled; a TeX source gives the full check.
 - **Detailed review** (`detailed_review`): the review, then the proofs are checked one at a
-  time, main results first, as far as the effort allows, with twice the budget of a review.
+  time, main results first, as far as the effort allows, with twice the working
+  time of a review. An explicit total token cap is not multiplied.
   The controller maps the manuscript (sections, numbered statements, their proofs, the
   results and equations each proof uses, its citations). Numbered major and minor comments
   on the proofs come from checked findings, with questions to the authors and a table of
@@ -112,6 +125,20 @@ contexts work; on a vLLM server (`--backend openai`) independent checks run
 `--assistant-concurrency` at a time. Checks think before they answer when the output
 ceiling leaves room. The manuscript map reads TeX best; for PDFs it relies on the text
 extraction, whose formulas can be garbled.
+
+The selected depth produces a finite saved plan of reading parts and proof or
+explanation checks. A long proof can be split into source packets with its
+statement, hypotheses and required dependencies. Completed usable parts are
+reused on resume. An unusable explanation can receive a larger output allowance
+or a smaller complete source packet, within bounded recovery; an unchanged
+failed call is not retried indefinitely. If essential dependencies cannot fit,
+the worker reports that limitation rather than silently removing them.
+
+The interface shows finished and pending plan parts separately from source lines
+read. These counts measure operational coverage, not correctness. A final partial
+report names missing checks; it is not shown as a completed audit. A user pause
+preserves pending work for resume, while a terminal failure or exhausted recovery
+is reported as such instead of presenting an ineffective Resume action.
 
 ## LaTeX write-ups
 
@@ -155,14 +182,25 @@ resume uses the original remaining allowance.
 | Option | Default |
 | --- | ---: |
 | `--research-rounds` | 6 |
-| `--research-tokens` | 24,000 generated tokens |
-| `--research-input-tokens` | 100,000 cumulative input tokens |
+| `--research-tokens` | no cumulative cap; optional generated-token limit |
+| `--research-input-tokens` | no cumulative cap; optional cumulative input-token limit |
 | `--research-seconds` | 900 seconds |
 | `--research-requests` | 12 external retrieval requests |
 | `--research-chars` | 30,000 returned evidence characters |
 
-Planning, research, drafting and review share these limits. A model-reviewed
-report is not a verified proof or an exhaustive literature survey. Failure to
+Planning, research, drafting and review share working time and any explicit caps.
+Effort sets depth and a finite work plan, not a fixed cumulative token allowance.
+Explicit numeric caps and usage in older saved jobs remain unchanged on resume.
+Per-call context capacity, phase output allowances and request timeouts still
+apply when cumulative tokens are uncapped.
+
+The interface's **Output** counter separates settled charged output from temporary
+reservations. **Cumulative input tokens** includes repeated text across calls;
+it is not context occupancy. **Current input context** is shown only when a
+per-call measurement is recorded, and output also occupies that context.
+Interrupted calls without usage reports retain their reserved charge.
+
+A model-reviewed report is not a verified proof or an exhaustive literature survey. Failure to
 find a result does not establish novelty.
 
 ## Permissions

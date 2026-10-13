@@ -1,6 +1,6 @@
 // Markdown with typeset mathematics. Model and source text is untrusted:
 // no raw HTML, no images, KaTeX with trust disabled, and only http(s)/mailto links.
-import { memo, useMemo } from 'react'
+import { memo, useMemo, type ReactNode } from 'react'
 import ReactMarkdown, { type Components } from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import remarkMath from 'remark-math'
@@ -13,6 +13,7 @@ const KATEX = { throwOnError: false, strict: 'ignore', trust: false, maxExpand: 
 // -- rendering ---------------------------------------------------------------------
 
 const safeUrl = (url: string) => (/^(https?:|mailto:)/i.test(url) ? url : '')
+const inlineText = ({ children }: { children?: ReactNode }) => <>{children}</>
 
 type Props = {
   children: string
@@ -28,7 +29,9 @@ export const Markdown = memo(function Markdown({ children, className, onCite, fl
       <a href={href} target="_blank" rel="noopener noreferrer nofollow">{label}</a>
     ),
     img: ({ alt }) => <span className="img-alt">(image{alt ? `: ${alt}` : ''} not loaded)</span>,
-    ...(inline ? { p: ({ children: text }) => <>{text}</> } : {}),
+    // Compact previews keep heading text and inline math without heading size.
+    ...(inline ? { p: inlineText, h1: inlineText, h2: inlineText, h3: inlineText,
+      h4: inlineText, h5: inlineText, h6: inlineText } : {}),
     cite: (props) => {
       const ref = String((props as Record<string, unknown>)['data-cite'] || '')
       const bad = flagged?.has(ref)

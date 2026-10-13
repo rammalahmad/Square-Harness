@@ -18,7 +18,8 @@ import subprocess
 import tempfile
 
 from .ledger import _atomic_write
-from .research import ResearchRunner
+from .research import ResearchRunner, remaining_limit
+from .worker_errors import WorkerInputError
 
 TEMPLATE_SUFFIXES = ('.sty', '.cls', '.tex', '.bib')
 REF = re.compile(r'(M\d+):L(\d+)(?:-L?(\d+))?')
@@ -181,7 +182,7 @@ class WriteupRunner(ResearchRunner):
 
     def _room(self, cap):
         """Characters of source text that fit next to the fixed instructions."""
-        return max(1500, (self.agent.ctx - cap - 256) * 3 - 9000)
+        return max(512, self.agent.ctx - cap - 512 - 7000)
 
     def _read_range(self, source_id, start, end):
         """Read through the recorded manuscript tool, so provenance checks see these lines."""
@@ -201,10 +202,10 @@ class WriteupRunner(ResearchRunner):
             if not match or not any(s['id'] == match.group(1) for s in self.state['sources']):
                 continue
             source_id, a, b = match.group(1), int(match.group(2)), int(match.group(3) or match.group(2))
-            b = min(b, a + 199)
             text = '\n'.join(f'{source_id} L{item["line"]}: {item["text"]}' for item in self._read_range(source_id, a, b))
             if used + len(text) > room:
-                text, clipped = text[:max(0, room - used)], True
+                raise WorkerInputError('The complete write-up source range does not fit. No formula or hypothesis was cut; split this source section.',
+                                       code='source_context_overflow', scope='context', details={'source': source_id, 'start': a, 'end': b})
             parts.append(text)
             used += len(text)
             if clipped:
@@ -307,13 +308,13 @@ class WriteupRunner(ResearchRunner):
             for a, b in groups:
                 sections.append({'title': 'Further notes' if sections else 'Notes',
                                  'sources': [f'{source["id"]}:L{a}-L{b}'], 'goal': 'Write up these notes faithfully.'})
-        return {'title': title or 'Notes', 'sections': sections[:24]}
+        return {'title': title or 'Notes', 'sections': sections}
 
     def _section(self):
         sections = self.state['sections']
         index = next(i for i, section in enumerate(sections) if not section['complete'])
         section = sections[index]
-        cap = min(4096, self.agent.predict)
+        cap = 8192
         excerpt, clipped = self._excerpt(section['sources'], self._room(cap) // 2)
         if clipped:
             self.state['warnings'].append(f'Section "{section["title"]}" saw only part of its source lines; split the notes or raise the context.')
@@ -326,9 +327,20 @@ class WriteupRunner(ResearchRunner):
         result = self._call('section', instruction, cap=cap)
         section['latex'] = _clean_section(result['text'], section['title'])
         section['truncated'] = not result['complete']
-        section['complete'] = True
+        section['complete'] = result['complete'] and bool(result['text'].strip())
         if section['truncated']:
-            self.state['warnings'].append(f'Section "{section["title"]}" hit the output limit and may be cut short.')
+            if not section.get('larger_attempted'):
+                previous_cap = result.get('output_limit', self.state['calls'][-1]['reserved_tokens'] if self.state['calls'] else cap)
+                section['larger_attempted'] = True
+                self._save()
+                result = self._call('section', instruction, cap=16384, minimum_output=previous_cap + 1)
+                section['latex'] = _clean_section(result['text'], section['title'])
+                section['truncated'] = not result['complete']
+                section['complete'] = result['complete'] and bool(result['text'].strip())
+            if not section['complete']:
+                raise WorkerInputError(f'Section "{section["title"]}" was not completed after bounded output recovery. '
+                                       'Its partial text is saved and is not marked complete.',
+                                       code='writeup_generation_failed', scope='generation')
         if all(s['complete'] for s in sections):
             self.state['phase'] = 'assemble'
 
@@ -403,7 +415,7 @@ class WriteupRunner(ResearchRunner):
             instruction = ('Fix the LaTeX compile errors in this section. Change only what the errors require, keep the '
                            '% src comments, and output the whole corrected section.\n\n' + self._vocabulary_note() +
                            '\n\nERRORS:\n' + '\n'.join(errors) + '\n\nSECTION:\n' + section['latex'])
-            result = self._call('repair', instruction, cap=min(4096, self.agent.predict))
+            result = self._call('repair', instruction, cap=8192)
             if result['text'].strip() and result['complete']:
                 section['latex'] = _clean_section(result['text'], section['title'])
         self._assemble()
@@ -411,34 +423,34 @@ class WriteupRunner(ResearchRunner):
 
     def _review(self):
         settings = self.state['settings']
-        if (settings['max_tokens'] - self.state['tokens_charged'] < 1200
-                or settings['max_input_tokens'] - self.state['input_tokens_charged'] < 6000):
+        if (remaining_limit(settings, 'max_tokens', self.state['tokens_charged']) < 1200
+                or remaining_limit(settings, 'max_input_tokens', self.state['input_tokens_charged']) < 6000):
             self.state['warnings'].append('Not enough budget remained for an independent review.')
             self.state['phase'] = 'export'
             return
-        refs = [ref for section in self.state['sections'] for ref in section['sources']]
-        excerpt, _ = self._excerpt(refs, self._room(2000) // 3)
         compile_state = self.state['compile'] or {}
         status = ('compiled without errors' if compile_state.get('ok') else 'not compiled' if not compile_state.get('available')
-                  else 'failed to compile: ' + '; '.join(e['message'] for e in compile_state.get('errors', [])[:5]))
-        document = self.state['document']
-        room = self._room(1500)
-        if len(document) + len(excerpt) > room:
-            document = document[: max(1000, room - len(excerpt))] + '\n% [document excerpt ends here]'
-        instruction = ('WRITE-UP TO REVIEW:\n' + document + '\n\nSOURCE LINES:\n' + excerpt +
-                       '\n\nCompilation: ' + status + '\nCitation checks: ' + json.dumps(self.state.get('citation_issues', [])))
-        # Not the research 'review' role: that one checks literature evidence in context.
-        # The request comes last, where small models follow it instead of copying the document.
-        result = self._call('fidelity', instruction, cap=1500,
-                            trailer=REVIEW_POLICY + '\nWrite the review now. Do not reproduce the document.')
-        text = result['text'].strip()
-        copied = text.startswith('\\documentclass') or text.count('\\section') > 2
-        self.state['review'] = '' if copied else result['text']
-        self.state['review_complete'] = result['complete'] and bool(text) and not copied
-        if copied:
-            self.state['warnings'].append('The reviewer returned LaTeX instead of a review; the write-up is unreviewed.')
-        elif not result['complete']:
-            self.state['warnings'].append('The review hit its output limit and may be incomplete.')
+                  else 'failed to compile')
+        for section in self.state['sections']:
+            if section.get('review_complete'):
+                continue
+            excerpt, _ = self._excerpt(section['sources'], self._room(2000))
+            instruction = ('WRITE-UP TO REVIEW:\n' + section['latex'] + '\n\nSOURCE LINES:\n' + excerpt +
+                           '\n\nCompilation: ' + status + '\nCitation checks: ' + json.dumps(self.state.get('citation_issues', [])))
+            result = self._call('fidelity', instruction, cap=2000,
+                                trailer=REVIEW_POLICY + '\nWrite the review now. Do not reproduce the document.')
+            text = result['text'].strip()
+            copied = (text.startswith(('\\documentclass', '\\section', '\\begin{document}'))
+                      or text == section['latex'].strip() or text.count('\\section') > 2)
+            if copied:
+                warning = 'The reviewer returned LaTeX instead of a review; the write-up is unreviewed.'
+                if warning not in self.state['warnings']:
+                    self.state['warnings'].append(warning)
+            section['review'] = '' if copied else result['text']
+            section['review_complete'] = result['complete'] and bool(text) and not copied
+            self._save()
+        self.state['review'] = '\n\n'.join(s['review'] for s in self.state['sections'] if s.get('review', '').strip())
+        self.state['review_complete'] = all(s.get('review_complete') for s in self.state['sections'])
         self.state['phase'] = 'export'
 
     def _free_path(self, name):
@@ -475,6 +487,13 @@ class WriteupRunner(ResearchRunner):
                     and self.state.get('review_complete'))
         self.state['status'] = 'complete' if complete else 'partial'
         self.state['stop_reason'] = 'Write-up finished; check the mathematics before using it.'
+
+    def _progress(self):
+        sections = self.state.get('sections', [])
+        return {'phase': self.state['phase'], 'completed': sum(bool(s.get('complete') and not s.get('truncated')) for s in sections),
+                'total': len(sections), 'unit': 'write-up parts', 'scope': self.state['goal'],
+                'partial': self.state['status'] in ('partial', 'error', 'budget_exhausted'),
+                'resumable': self.state['status'] in ('running', 'paused')}
 
     def _report(self):
         s = self.state

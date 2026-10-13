@@ -1,6 +1,6 @@
 import { useEffect, useState, type FormEvent } from 'react'
 import { api, type Template } from '../api'
-import { Collapse, ErrorNote, FilePicker, NumberField } from '../components/common'
+import { Collapse, ErrorNote, FilePicker, NumberField, OptionalNumberField } from '../components/common'
 import { EffortSlider, effortLimits, type EffortLevel } from '../components/Effort'
 import { useDropTarget } from '../drop'
 import { go } from '../router'
@@ -21,9 +21,9 @@ export function WriteupNew() {
   const [saved, setSaved] = useState('')
   const [remember, setRemember] = useState('')
   const [output, setOutput] = useState('')
-  const [tokens, setTokens] = useState(60000)
+  const [tokens, setTokens] = useState<number | null>(null)
   const [minutes, setMinutes] = useState(15)
-  const [inputTokens, setInputTokens] = useState(240000)
+  const [inputTokens, setInputTokens] = useState<number | null>(null)
   const [error, setError] = useState('')
   const [busy, setBusy] = useState(false)
   const [queuedNote, setQueuedNote] = useState('')
@@ -167,9 +167,9 @@ export function WriteupNew() {
             {d && <EffortSlider kind="writeup" defaults={d} level={level} onLevel={chooseLevel} custom={custom} />}
             <Collapse summary="Advanced limits">
               <div className="field-grid">
-                <NumberField label="Generated tokens" value={tokens} onChange={setTokens} step={1000} />
+                <OptionalNumberField label="Total output token limit" value={tokens} onChange={setTokens} hint="Optional. Leave blank for no cumulative limit." />
                 <NumberField label="Time" value={minutes} onChange={setMinutes} min={1} suffix="min" />
-                <NumberField label="Input tokens" value={inputTokens} onChange={setInputTokens} step={10000} hint="Every call's context counts again" />
+                <OptionalNumberField label="Total input token limit" value={inputTokens} onChange={setInputTokens} step={10000} hint="Optional. Repeated input counts again; this is not the context size." />
               </div>
             </Collapse>
           </div>

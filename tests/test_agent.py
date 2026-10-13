@@ -110,14 +110,16 @@ class LoopTests(unittest.TestCase):
         agent.run('Prove it', lambda kind, value: events.append((kind, value)))
         self.assertTrue(any('output limit' in value for kind, value in events))
 
-    def test_old_turn_pruning_is_explicit(self):
+    def test_old_human_hypotheses_are_not_pruned_to_fit(self):
         agent = Agent(FakeClient([final()]), self.ws)
         agent.history = [{'role': 'user', 'content': 'old' * 10000},
                          {'role': 'assistant', 'content': 'old response'}]
         events = []
-        agent.run('New question', lambda kind, value: events.append(value))
-        self.assertTrue(any('Dropped' in v for v in events))
-        self.assertEqual(agent.history[0]['content'], 'New question')
+        with self.assertRaisesRegex(AgentError, 'No hypotheses'):
+            agent.run('New question', lambda kind, value: events.append(value))
+        self.assertEqual(agent.history[0]['content'], 'old' * 10000)
+        self.assertFalse(any('Dropped' in v for v in events))
+        self.assertEqual(agent.client.requests, [])
 
     def test_current_turn_overflow_preserves_history(self):
         agent = Agent(FakeClient([]), self.ws)

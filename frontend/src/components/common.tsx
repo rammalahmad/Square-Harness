@@ -1,6 +1,8 @@
 import { useCallback, useEffect, useId, useRef, useState, type ReactNode } from 'react'
 import { createPortal } from 'react-dom'
-import { api, type WorkspaceFile } from '../api'
+import { api, type Budget, type WorkProgress, type WorkspaceFile } from '../api'
+import { meterDisplay } from '../usage'
+import { workProgressText } from '../workProgress'
 import { bytes, count } from '../format'
 import { useTick } from '../store'
 import { CloseIcon, FileIcon, PinIcon } from './Icons'
@@ -22,21 +24,38 @@ export function useLoad<T>(load: () => Promise<T>, deps: unknown[]) {
   return { data, error, reload: run }
 }
 
-export function Meter({ label, used, limit, unit = '', decimals = 0 }: { label: string; used: number; limit: number; unit?: string; decimals?: number }) {
-  const ratio = limit > 0 ? Math.min(1, used / limit) : 0
-  const show = (value: number) => (decimals ? new Intl.NumberFormat(undefined, { maximumFractionDigits: decimals, minimumFractionDigits: decimals }).format(value) : count(value))
-  const tone = ratio >= 1 ? ' meter-full' : ratio > 0.85 ? ' meter-high' : ''
+export function Meter({ label, used, limit, unit = '', decimals = 0, title }: { label: string; used: number; limit: number | null; unit?: string; decimals?: number; title?: string }) {
+  const display = meterDisplay({ used, limit }, unit, decimals)
+  const tone = display.ratio === null ? '' : display.ratio >= 1 ? ' meter-full' : display.ratio > 0.85 ? ' meter-high' : ''
   return (
-    <div className={'meter' + tone}>
+    <div className={'meter' + tone} title={title}>
       <div className="meter-text">
         <span>{label}</span>
-        <span className="meter-value">{show(used)}{unit} <span className="meter-of">of {show(limit)}{unit}</span></span>
+        <span className="meter-value">{display.used}{display.limit && <> <span className="meter-of">of {display.limit}</span></>}</span>
       </div>
-      <div className="meter-track" role="progressbar" aria-label={label} aria-valuemin={0} aria-valuemax={limit} aria-valuenow={used}>
-        <div className="meter-bar" style={{ transform: `scaleX(${ratio})` }} />
-      </div>
+      {limit !== null && <div className="meter-track" role="progressbar" aria-label={label} aria-valuemin={0} aria-valuemax={limit} aria-valuenow={used}>
+        <div className="meter-bar" style={{ transform: `scaleX(${display.ratio})` }} />
+      </div>}
     </div>
   )
+}
+
+/** Usage is cumulative; a reservation is capacity for an unfinished call. */
+export function UsageMeters({ budget }: { budget: { tokens: Budget; input_tokens?: Budget; seconds: Budget; context?: Budget } }) {
+  return <>
+    <Meter label="Output tokens" {...budget.tokens} title="Cumulative output, including thinking. A call with unreported usage may be charged conservatively." />
+    {!!budget.tokens.reserved && <p className="muted small">{count(budget.tokens.reserved)} tokens reserved for the current calls; separate from output used.</p>}
+    {budget.input_tokens && <Meter label="Cumulative input tokens" {...budget.input_tokens} title="Input summed across model calls; repeated text counts again. This is not the current context size." />}
+    {budget.context && <Meter label="Current input context" {...budget.context} title="Input to the current model call, against its context capacity. Generated output also uses this capacity." />}
+    <Meter label="Working time, minutes" used={budget.seconds.used / 60} limit={budget.seconds.limit === null ? null : budget.seconds.limit / 60} decimals={1} />
+  </>
+}
+
+export function WorkProgressNote({ progress, status, running = false }: { progress?: WorkProgress | null; status: string; running?: boolean }) {
+  if (!progress) return null
+  return <div className="work-progress" role="status" title={progress.scope || undefined}>
+    <p className="muted small">{workProgressText(progress, status, running)}</p>
+  </div>
 }
 
 export function Collapse({ summary, children, open, className }: { summary: ReactNode; children: ReactNode; open?: boolean; className?: string }) {
@@ -78,6 +97,19 @@ export function NumberField({ label, value, onChange, min, max, step = 1, hint, 
       {hint && <span className="field-hint">{hint}</span>}
     </label>
   )
+}
+
+export function OptionalNumberField({ label, value, onChange, step = 1000, hint }: {
+  label: string; value: number | null; onChange: (value: number | null) => void; step?: number; hint?: string
+}) {
+  return <label className="field">
+    <span className="field-label">{label}</span>
+    <span className="field-input">
+      <input type="number" inputMode="numeric" value={value === null ? '' : value} min={1} step={step} placeholder="No limit"
+        onChange={(event) => onChange(event.target.value === '' ? null : event.target.valueAsNumber)} />
+    </span>
+    {hint && <span className="field-hint">{hint}</span>}
+  </label>
 }
 
 export function Toggle({ label, checked, onChange, disabled, hint }: {

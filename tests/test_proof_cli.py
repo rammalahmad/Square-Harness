@@ -37,7 +37,7 @@ class ProofCliTests(unittest.TestCase):
     def test_defaults_offer_direct_sized_solve_and_separate_verification(self):
         self.assertEqual(self.run_cli(['--prompt', 'Prove x=x.']), 0)
         self.runner.start.assert_called_once_with('Prove x=x.', max_rounds=3,
-            max_tokens=120000, max_seconds=1800, max_predict=32768,
+            max_tokens=None, max_seconds=1800, max_predict=32768,
             verify_tokens=16384, min_solve_tokens=None, repair_tokens=None, verify_temperature=None, source_files=[])
         self.assertIn(self.result['answer'], self.output())
         self.assertIn(self.result['report'], self.output())
@@ -55,12 +55,16 @@ class ProofCliTests(unittest.TestCase):
         self.assertEqual(options['max_seconds'], 90)
 
     def test_invalid_or_starved_new_job_stops_before_model_contact(self):
-        for flags in (['--proof-tokens', '8000'], ['--ctx', '8192'],
-                      ['--proof-solve-tokens', '40960']):
+        for flags in (['--proof-tokens', '8000'],):
             with self.subTest(flags=flags):
                 self.assertEqual(self.run_cli([*flags, '--prompt', 'Prove it.']), 1)
         self.client.models.assert_not_called()
         self.runner.start.assert_not_called()
+
+    def test_specialist_output_cap_is_explicit_and_cumulative_caps_default_to_null(self):
+        args = cli.parser().parse_args(['--specialist-output-tokens', '8192'])
+        self.assertEqual(args.specialist_output_tokens, 8192)
+        self.assertEqual((args.proof_tokens, args.research_tokens, args.research_input_tokens), (None, None, None))
 
     def test_removed_options_cannot_silently_activate_an_old_algorithm(self):
         for flag in ('--proof-strategy=cooperative', '--proof-workers=3', '--proof-literature',

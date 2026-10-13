@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState, type FormEvent } from 'react'
 import { api, type WorkspaceFile } from '../api'
-import { Collapse, ErrorNote, FilePicker, NumberField } from '../components/common'
+import { Collapse, ErrorNote, FilePicker, NumberField, OptionalNumberField } from '../components/common'
 import { EffortSlider, effortLimits, type EffortLevel } from '../components/Effort'
 import { Markdown } from '../components/Markdown'
 import { useDropTarget } from '../drop'
@@ -18,7 +18,7 @@ export function ProofNew() {
   const [goal, setGoal] = useState('')
   const [files, setFiles] = useState<string[]>([])
   const [rounds, setRounds] = useState(3)
-  const [tokens, setTokens] = useState(60000)
+  const [tokens, setTokens] = useState<number | null>(null)
   const [minutes, setMinutes] = useState(15)
   const [solveTokens, setSolveTokens] = useState(32768)
   const [verifyTokens, setVerifyTokens] = useState(16384)
@@ -150,13 +150,13 @@ export function ProofNew() {
           <span className="in-margin" />
           <div>
             {defaults && <EffortSlider kind="proof" defaults={defaults} level={level} onLevel={chooseLevel} custom={custom} />}
-            <p className="field-hint">The limits are saved with the job. Resuming later continues from what is left; it never grants a new budget. Thinking is always on for proofs and counts toward the output ceilings.</p>
+            <p className="field-hint">Effort sets the number of approaches and checks. Work is saved when paused. Optional limits stay with the job when you resume.</p>
             <Collapse summary="Advanced limits">
               <div className="field-grid">
                 <NumberField label="Attempts" value={rounds} onChange={setRounds} min={1} max={100}
                   hint="The initial solve and each repair or continuation" />
-                <NumberField label="Generated tokens" value={tokens} onChange={setTokens} step={1000}
-                  hint={`At least one solve and one review: ${(solveTokens + verifyTokens).toLocaleString()}`} />
+                <OptionalNumberField label="Total output token limit" value={tokens} onChange={setTokens}
+                  hint="Optional. Includes thinking across all calls; leave blank for no cumulative limit." />
                 <NumberField label="Time" value={minutes} onChange={setMinutes} min={1} suffix="min" />
                 <NumberField label="Solve output ceiling" value={solveTokens} onChange={setSolveTokens} min={128} step={1024}
                   hint="Tokens per solve, including thinking" />

@@ -16,7 +16,7 @@ import unicodedata
 
 from .ledger import _atomic_write, _bytes
 from .literature import bibliography_entry, bibliography_keys, cited_keys, cites_place
-from .research import ResearchRunner
+from .research import ResearchRunner, remaining_limit
 
 LEVELS = ('read', 'cited', 'located', 'contradicted', 'not_found')
 RANK = {'read': 4, 'cited': 3, 'located': 2, 'contradicted': 1, 'not_found': 0}
@@ -223,12 +223,13 @@ class CheckRunner(ResearchRunner):
         self._guesses = [g for g in (_clean_candidate(g, 'caller') for g in guesses or []) if g][:3]
         self._level = dict(level)
         budgets = dict(max_rounds=level['candidates'] * level['verify_rounds'] + level['verify_rounds'],
-                       max_tokens=level['tokens'], max_input_tokens=level['input'], max_seconds=level['seconds'],
+                       max_tokens=None, max_input_tokens=None, max_seconds=level['seconds'],
                        max_requests=level['requests'], max_chars=level['chars'])
         standard_bounds = dict(budgets)
         budgets.update({k: v for k, v in overrides.items() if k in budgets and v is not None})
         if lookup == 'standard':
-            budgets = {key: min(value, standard_bounds[key]) for key, value in budgets.items()}
+            budgets = {key: min(value, standard_bounds[key]) if value is not None and standard_bounds[key] is not None else value
+                       for key, value in budgets.items()}
         return super().start(question, kind='check', **budgets)
 
     def _pin(self, names, prefix):
@@ -281,8 +282,8 @@ class CheckRunner(ResearchRunner):
     def _out_of_time(self, share=.85):
         settings = self.state['settings']
         return (self._elapsed() >= settings['max_seconds'] * share
-                or settings['max_tokens'] - self.state['tokens_charged'] < 900
-                or settings['max_input_tokens'] - self.state['input_tokens_charged'] < 6000)
+                or remaining_limit(settings, 'max_tokens', self.state['tokens_charged']) < 900
+                or remaining_limit(settings, 'max_input_tokens', self.state['input_tokens_charged']) < 6000)
 
     def _step(self, phase):
         if phase == 'recall':

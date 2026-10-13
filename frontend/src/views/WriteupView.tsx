@@ -1,6 +1,6 @@
 import { useMemo, useState, type ReactNode } from 'react'
 import { api, type ResearchDetail } from '../api'
-import { ErrorNote, Loading, Meter, Tabs, useLoad } from '../components/common'
+import { ErrorNote, Loading, Tabs, UsageMeters, WorkProgressNote, useLoad } from '../components/common'
 import { PauseIcon, PlayIcon } from '../components/Icons'
 import { Markdown } from '../components/Markdown'
 import { researchLook, researchResumable, Square, type Variant } from '../components/Square'
@@ -75,6 +75,7 @@ function Header({ data, ours, pausing }: { data: ResearchDetail; ours: boolean; 
   const busy = capacityFull(app.snapshot, app.status)
   const ownTask = taskForJob(app.snapshot, 'research', data.id)?.task
   const queued = app.snapshot.queue.some((item) => item.target === data.id)
+  const resumable = data.progress?.resumable ?? researchResumable(data.status)
   const act = (action: Promise<unknown>) => { setError(''); action.catch((reason: Error) => setError(reason.message)) }
   const phase = data.phase === 'repair' ? 'compile' : data.phase
   const current = STEPS.indexOf(phase as typeof STEPS[number])
@@ -92,6 +93,7 @@ function Header({ data, ours, pausing }: { data: ResearchDetail; ours: boolean; 
           return <li key={step} className={'phase phase-' + variant}><Square variant={variant} size={10} />{step === 'compile' && data.phase === 'repair' ? 'Repair' : STEP_NAMES[step]}</li>
         })}
       </ol>
+      <WorkProgressNote progress={data.progress} status={data.status} running={data.running} />
       <div className="job-facts">
         {data.sources.map((source) => <span key={source.id} className="fact-file">{source.id} {source.path}</span>)}
         <span>{String(data.settings.model)}</span>
@@ -106,13 +108,13 @@ function Header({ data, ours, pausing }: { data: ResearchDetail; ours: boolean; 
       <div className="job-actions">
         {ours ? (
           <button type="button" className="btn" disabled={pausing} onClick={() => act(api.pause(ownTask!.id))}><PauseIcon size={16} /> {pausing ? 'Pausing…' : 'Pause'}</button>
-        ) : researchResumable(data.status) ? (
+        ) : resumable ? (
           <button type="button" className="btn btn-primary" disabled={queued} onClick={() => act(api.resumeResearch(data.id, true))}>
-            <PlayIcon size={16} /> {queued ? 'Waiting in the queue' : busy ? 'Queue resume' : 'Resume with the remaining budget'}
+            <PlayIcon size={16} /> {queued ? 'Waiting in the queue' : busy ? 'Queue resume' : 'Resume saved work'}
           </button>
         ) : null}
       </div>
-      {!ours && busy && researchResumable(data.status) && !queued && <BusyNote queue />}
+      {!ours && busy && resumable && !queued && <BusyNote queue />}
       <ErrorNote>{error}</ErrorNote>
     </header>
   )
@@ -266,10 +268,8 @@ function Aside({ data, issues, cite, onCite, sources }: { data: ResearchDetail; 
         ) : <p className="muted small">No template: standard amsart with amsmath and amsthm.</p>}
       </section>
       <section className="aside-section">
-        <h3 className="aside-title">Budget</h3>
-        <Meter label="Generated tokens" used={b.tokens.used} limit={b.tokens.limit} />
-        <Meter label="Input tokens" used={b.input_tokens.used} limit={b.input_tokens.limit} />
-        <Meter label="Time, minutes" used={b.seconds.used / 60} limit={b.seconds.limit / 60} decimals={1} />
+        <h3 className="aside-title">Usage</h3>
+        <UsageMeters budget={b} />
       </section>
     </div>
   )

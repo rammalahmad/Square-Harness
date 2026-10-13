@@ -38,7 +38,7 @@ def sse(*events, done=True):
 
 
 @contextmanager
-def fixture(*responses, status=200, model_data=None):
+def fixture(*responses, status=200, model_data=None, default_tokenizer=False):
     requests, paths, replies = [], [], list(responses)
 
     class Handler(BaseHTTPRequestHandler):
@@ -52,6 +52,12 @@ def fixture(*responses, status=200, model_data=None):
             self.wfile.write(json.dumps({'data': [{'id': 'square-qwen'}]} if model_data is None else model_data).encode())
 
         def do_POST(self):
+            if self.path == '/tokenize' and default_tokenizer:
+                self.rfile.read(int(self.headers['Content-Length']))
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(json.dumps({'count': 200, 'max_model_len': 32768}).encode())
+                return
             paths.append(self.path)
             requests.append(json.loads(self.rfile.read(int(self.headers['Content-Length']))))
             self.send_response(status)
@@ -157,7 +163,7 @@ class BackendTests(unittest.TestCase):
             'index': 0, 'id': 'call_', 'type': 'function', 'function': {'name': 'read_', 'arguments': '{"pa'}}]),
             delta(tool_calls=[{'index': 0, 'id': 'abc', 'function': {'name': 'file', 'arguments': 'th":"lemma.txt"}'}}]),
             finish('tool_calls'), usage())
-        with fixture(tool, sse(delta('A counterexample exists.'), finish(), usage())) as (client, requests, _):
+        with fixture(tool, sse(delta('A counterexample exists.'), finish(), usage()), default_tokenizer=True) as (client, requests, _):
             with tempfile.TemporaryDirectory() as tmp:
                 (Path(tmp) / 'lemma.txt').write_text('Every integer is even.')
                 agent = Agent(client, Workspace(tmp), model='square-qwen', ctx=16384)
@@ -367,7 +373,8 @@ class LlamaCppBackendTests(unittest.TestCase):
                 self.assertEqual(agent.run('Read lemma.txt'), 'Not every integer is even.')
             count_requests = [body for path, body in requests if path.endswith('/input_tokens')]
             generation_requests = [body for path, body in requests if path.endswith('/completions')]
-            self.assertEqual(count_requests, generation_requests)
+            self.assertEqual(count_requests[1::2], generation_requests)
+            self.assertEqual(count_requests[::2], generation_requests)
             history = generation_requests[1]['messages']
             self.assertEqual(history[-2]['reasoning_content'], 'Inspect the statement.')
             self.assertNotIn('reasoning', history[-2])

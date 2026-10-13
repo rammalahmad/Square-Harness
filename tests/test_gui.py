@@ -365,7 +365,7 @@ class ProofWorkflowTests(GuiCase):
         for body in ({'goal': ''}, {'goal': 'x', 'rounds': 0}, {'goal': 'x', 'rounds': True},
                      {'goal': 'x', 'seconds': -1}, {'goal': 'x', 'source_files': ['../escape.tex']},
                      {'goal': 'x', 'ctx': 1024}, {'goal': 'x', 'tokens': 6000},
-                     {'goal': 'x', 'solve_tokens': 16200}, {'goal': 'x', 'verify_tokens': 64}):
+                     {'goal': 'x', 'solve_tokens': 64}, {'goal': 'x', 'verify_tokens': 64}):
             status, value, _ = self.request('POST', '/api/proofs', body)
             self.assertEqual(status, 400, (body, value))
         self.assertEqual(self.fake.requests, [])
@@ -488,7 +488,7 @@ class ResearchTests(GuiCase):
         self.assertEqual(sources[0]['id'], 'M1')
         stream = detail['calls'][0]['stream']
         self.assertEqual(self.ok('GET', f'/api/research/{job_id}/stream/{stream}?from=0')['text'], json.dumps(read))
-        self.assertTrue(all(request['think'] is False for request in self.fake.requests))
+        self.assertTrue(all(request['options']['num_predict'] > self.hub.args.predict for request in self.fake.requests))
 
     def test_quick_review_of_a_pasted_proof(self):
         check = {'explanation': 'Each step follows.', 'issues': [], 'verdict': 'no_issue_found'}
@@ -621,8 +621,7 @@ class BackendTests(unittest.TestCase):
         self.assertEqual(hub.models(), {'reachable': True, 'models': [MODEL]})
 
     def test_new_proofs_are_checked_like_the_terminal_before_any_job_exists(self):
-        cases = ((['--ctx', '8192'], {'solve_tokens': 8192}, 'context'),
-                 ([], {'tokens': 40000}, 'one full solve and its review'),
+        cases = (([], {'tokens': 40000}, 'one full solve and its review'),
                  (['--proof-repair-tokens', '8000'], {'solve_tokens': 4096}, '--proof-repair-tokens 8000'),
                  (['--proof-min-solve-tokens', '6000'], {'solve_tokens': 4096}, '--proof-min-solve-tokens 6000'))
         for extra, limits, message in cases:

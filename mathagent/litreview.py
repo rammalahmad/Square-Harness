@@ -16,7 +16,7 @@ import re
 
 from .ledger import _atomic_write, _bytes
 from .literature import LiteratureError, _fold
-from .research import ResearchRunner, _reference_prompt
+from .research import ResearchRunner, _reference_prompt, remaining_limit
 
 PIPELINE = 'reading-list-v1'
 PHASES = ('scope', 'sweep', 'graph', 'screen', 'organise', 'annotate', 'write', 'done')
@@ -106,7 +106,8 @@ class ReviewRunner(ResearchRunner):
 
     def _extra_state(self):
         return {'pipeline': PIPELINE, 'scope': None, 'pool': [], 'sweep_log': [], 'screened': {}, 'down': [],
-                'screen_order': [], 'organisation': None, 'annotations': {}, 'unverified': [], 'msc_seen': {}}
+                'screen_order': [], 'organisation': None, 'annotations': {}, 'unverified': [], 'msc_seen': {},
+                'screen_attempts': {}, 'annotation_attempts': {}, 'screen_failed': {}, 'annotation_failed': {}}
 
     @property
     def emit(self):
@@ -125,6 +126,8 @@ class ReviewRunner(ResearchRunner):
         return breadth(self.state['settings']['max_rounds'])
 
     def _json(self, result):
+        if result.get('complete') is False:
+            return None
         try:
             value = json.loads(result['text'])
         except ValueError:
@@ -134,8 +137,8 @@ class ReviewRunner(ResearchRunner):
     def _remaining(self, share):
         settings = self.state['settings']
         return (self._elapsed() < settings['max_seconds'] * share
-                and settings['max_tokens'] - self.state['tokens_charged'] > 1500
-                and settings['max_input_tokens'] - self.state['input_tokens_charged'] > 8000)
+                and remaining_limit(settings, 'max_tokens', self.state['tokens_charged']) > 1500
+                and remaining_limit(settings, 'max_input_tokens', self.state['input_tokens_charged']) > 8000)
 
     def _log(self, source, query, count=None, error=None):
         self.state['sweep_log'].append({'source': source, 'query': query, 'results': count, 'error': error})
@@ -269,7 +272,14 @@ class ReviewRunner(ResearchRunner):
         material = ''
         for source in self.state['sources']:
             # The model reads the start of a pinned manuscript to find the topic; queries stay public words.
-            material += f'\nPINNED MANUSCRIPT {source["id"]} ({source["path"]}), first part:\n' + source['content'][:6000]
+            shown, size = [], 0
+            for n, line in enumerate(source['content'].splitlines(), 1):
+                if size + len(line.encode()) > 6000:
+                    break
+                shown.append(f'L{n}: {line}')
+                size += len(line.encode())
+            material += (f'\nPINNED MANUSCRIPT {source["id"]} ({source["path"]}), exact opening excerpt '
+                         f'1-{len(shown)}; remainder omitted:\n' + '\n'.join(shown))
         if 'reference_context' in self.state:
             # Only scoping uses the exact parent conversation. Duplicate history
             # is represented by a prefix reference; no message content is clipped.
@@ -295,7 +305,7 @@ class ReviewRunner(ResearchRunner):
         value = value or {}
         queries = [' '.join(str(q).split())[:120] for q in value.get('queries') or [] if str(q).strip()]
         if not queries:
-            queries = [' '.join(self.state['goal'].split())[:120]]
+            self.state['warnings'].append('No usable public topic queries were produced; private request text was not sent as a fallback query.')
         self.state['scope'] = {
             'topic': str(value.get('topic') or self.state['goal'])[:300], 'subfield': str(value.get('subfield') or '')[:200],
             'msc': [m for m in (str(x).strip().upper() for x in value.get('msc') or []) if re.fullmatch(r'\d\d[A-Z-]?\d{0,2}', m)][:3],
@@ -420,7 +430,9 @@ class ReviewRunner(ResearchRunner):
         return next((r for r in self.state['pool'] if r['n'] == n), None)
 
     def _screen(self):
-        todo = [n for n in self.state['screen_order'] if str(n) not in self.state['screened']]
+        attempts = self.state.setdefault('screen_attempts', {})
+        failed = self.state.setdefault('screen_failed', {})
+        todo = [n for n in self.state['screen_order'] if str(n) not in self.state['screened'] and attempts.get(str(n), 0) < 2]
         if not todo or not self._remaining(.7):
             kept = self._kept()
             self._note('Screening', f'{len(self.state["screened"])} screened, {len(kept)} kept as relevant:\n'
@@ -428,7 +440,7 @@ class ReviewRunner(ResearchRunner):
                                     + (f' ({v["note"]})' if v['note'] else '') for n, v in kept))
             self.state['phase'] = 'organise'
             return
-        batch = todo[:25]
+        batch = todo[:12 if attempts.get(str(todo[0]), 0) else 25]
         lines = '\n'.join(self._line(self._by_n(n), abstract=260) for n in batch)
         scope = self.state['scope']
         instruction = (
@@ -450,11 +462,14 @@ class ReviewRunner(ResearchRunner):
                 self.state['screened'][str(item['n'])] = {'relevance': relevance,
                                                           'role': item['role'], 'note': str(item.get('note') or '')[:120]}
                 answered.add(item['n'])
-        for n in batch:  # unanswered candidates count as screened out, so a bad batch cannot loop
+        for n in batch:
+            attempts[str(n)] = attempts.get(str(n), 0) + 1
             if n not in answered:
-                self.state['screened'][str(n)] = {'relevance': 0, 'role': 'exclude', 'note': 'no screening answer'}
+                failed[str(n)] = 'No usable screening answer; not classified as irrelevant.'
+            else:
+                failed.pop(str(n), None)
         if len(answered) < len(batch):
-            self.state['warnings'].append(f'{len(batch) - len(answered)} candidates got no screening answer and were left out.')
+            self.state['warnings'].append(f'{len(batch) - len(answered)} candidates got no screening answer; bounded smaller-batch recovery is available.')
 
     def _kept(self):
         kept = [(int(n), v) for n, v in self.state['screened'].items() if v['role'] != 'exclude' and v['relevance'] >= 2]
@@ -525,11 +540,13 @@ class ReviewRunner(ResearchRunner):
         return list(dict.fromkeys(o.get('entry', []) + [n for t in o.get('themes', []) for n in t['core'] + t['deeper']]))
 
     def _annotate(self):
-        todo = [n for n in self._chosen() if str(n) not in self.state['annotations']]
+        attempts = self.state.setdefault('annotation_attempts', {})
+        failed = self.state.setdefault('annotation_failed', {})
+        todo = [n for n in self._chosen() if str(n) not in self.state['annotations'] and attempts.get(str(n), 0) < 2]
         if not todo or not self._remaining(.9):
             self.state['phase'] = 'write'
             return
-        batch = todo[:12]
+        batch = todo[:6 if attempts.get(str(todo[0]), 0) else 12]
         lines = '\n'.join(self._line(self._by_n(n), abstract=600) for n in batch)
         instruction = (
             f'Annotate works for a reading list on: {self.state["scope"]["topic"]}. For each number write one or two '
@@ -541,10 +558,14 @@ class ReviewRunner(ResearchRunner):
         value = self._json(self._call('annotate', instruction, cap=2400, format_schema=ANNOTATE_SCHEMA)) or {}
         for item in value.get('items') or []:
             if isinstance(item, dict) and item.get('n') in batch and str(item.get('why') or '').strip():
-                self.state['annotations'][str(item['n'])] = {'why': str(item['why'])[:400],
-                                                             'prerequisite': str(item.get('prerequisite') or '')[:200]}
+                self.state['annotations'][str(item['n'])] = {'why': str(item['why']),
+                                                             'prerequisite': str(item.get('prerequisite') or '')}
         for n in batch:
-            self.state['annotations'].setdefault(str(n), {'why': '', 'prerequisite': ''})
+            attempts[str(n)] = attempts.get(str(n), 0) + 1
+            if str(n) not in self.state['annotations']:
+                failed[str(n)] = 'No usable annotation was produced.'
+            else:
+                failed.pop(str(n), None)
 
     # -- output ---------------------------------------------------------------------
 
@@ -644,6 +665,8 @@ class ReviewRunner(ResearchRunner):
     def _checks(self):
         """The skill's self-check, done by code."""
         o, issues = self.state['organisation'], []
+        if self.state.get('screen_failed'):
+            issues.append(f'{len(self.state["screen_failed"])} candidates could not be screened; generation failures are not relevance exclusions.')
         if not o:
             return ['The list was not organised into entry points and themes.']
         if not o['entry']:
@@ -655,6 +678,14 @@ class ReviewRunner(ResearchRunner):
         if missing:
             issues.append(f'{len(missing)} listed works have no annotation.')
         return issues
+
+    def _progress(self):
+        chosen = self._chosen() if self.state.get('organisation') else self.state.get('screen_order', [])
+        entries = self.state.get('annotations', {}) if self.state.get('organisation') else self.state.get('screened', {})
+        return {'phase': self.state['phase'], 'completed': sum(str(n) in entries for n in chosen),
+                'total': len(chosen), 'unit': 'literature items', 'scope': self.state['goal'],
+                'partial': self.state['status'] in ('partial', 'error', 'budget_exhausted'),
+                'resumable': self.state['status'] in ('running', 'paused')}
 
     def _report(self):
         s = self.state

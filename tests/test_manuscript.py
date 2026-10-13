@@ -113,6 +113,15 @@ class TexMapTests(unittest.TestCase):
 
 
 class TextMapTests(unittest.TestCase):
+    def test_long_extracted_statement_preserves_late_hypotheses(self):
+        statement = ['Theorem 1. For the following hypotheses:'] + ['Exact hypothesis ' + str(i) for i in range(75)]
+        statement += ['Crucial endpoint hypothesis T > T0.']
+        mapping = manuscript.build('\n'.join(statement + ['Proof. Apply the stated assumptions. □']), 'paper.pdf')
+        unit = mapping['units'][0]
+        self.assertEqual(unit['statement'], [1, len(statement)])
+        self.assertEqual(unit['proofs'], [[len(statement) + 1, len(statement) + 1]])
+        self.assertFalse(any('first 60' in warning for warning in mapping['warnings']))
+
     def test_markdown_statements_and_bare_proofs(self):
         mapping = manuscript.build(MARKDOWN, 'notes.md')
         names = [u['name'] for u in mapping['units']]

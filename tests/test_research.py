@@ -289,6 +289,9 @@ class ResearchTests(unittest.TestCase):
         draft = f'# Survey\nA claim [{DOC}:L1-L2].'
         runner = self.runner([response('Plan'), response(calls=[tool('read_paper', document_id=DOC), tool('read_paper', document_id='doc-' + 'b' * 24)]),
                               response('Enough evidence.'), response(draft), response('Approved.'), response(draft)], literature, ctx=4096)
+        # A known fake tokenizer leaves enough framing room at 4k while forcing
+        # the reviewer to omit one complete cached passage.
+        runner.agent.client.count_input_tokens = lambda payload: max(1, len(json.dumps(payload, ensure_ascii=False).encode()) // 3)
         result = runner.start('Review a topic')
         self.assertEqual(result['status'], 'partial')
         self.assertTrue(runner.state.get('review_context_issues'))

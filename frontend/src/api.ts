@@ -1,21 +1,38 @@
 // Typed client for the harness's local /api. Shapes mirror mathagent/gui/store.py.
 
-export type Budget = { used: number; limit: number }
+export type Budget = { used: number; limit: number | null; reserved?: number }
+
+export type WorkProgress = {
+  phase: string
+  completed: number
+  total: number
+  unit: string
+  scope: string
+  partial: boolean
+  resumable?: boolean
+}
+
+export type AssistantBudget = {
+  tokens: { used: number; reserved?: number; limit: number | null }
+  input_tokens?: { used: number; limit: number | null }
+  seconds: Budget
+  context?: Budget
+}
 
 export type Defaults = {
   ctx: number
   predict: number
   think: boolean
   proof_rounds: number
-  proof_tokens: number
+  proof_tokens: number | null
   proof_seconds: number
   proof_solve_tokens: number
   proof_verify_tokens: number
   proof_repair_tokens: number | null
   proof_min_solve_tokens: number | null
   research_rounds: number
-  research_tokens: number
-  research_input_tokens: number
+  research_tokens: number | null
+  research_input_tokens: number | null
   research_seconds: number
   research_requests: number
   research_chars: number
@@ -195,7 +212,8 @@ export type ProofDetail = {
     max_rounds: number; model: string; ctx: number; max_predict?: number; verify_tokens?: number
     repair_tokens?: number; verify_temperature?: number; harness_version?: string
   }
-  budget: { rounds: Budget; tokens: Budget; seconds: Budget }
+  budget: { rounds: Budget; tokens: Budget; seconds: Budget; context?: Budget }
+  progress?: WorkProgress | null
   sources: { path: string; sha256?: string; lines: number }[]
   candidates: Candidate[]
   reviews: Review[]
@@ -259,7 +277,8 @@ export type ResearchDetail = {
   created_at: string
   updated_at: string
   settings: Record<string, unknown> & { online?: boolean; model: string }
-  budget: { rounds: Budget; tokens: Budget; input_tokens: Budget; seconds: Budget; requests: Budget; chars: Budget }
+  budget: { rounds: Budget; tokens: Budget; input_tokens: Budget; seconds: Budget; requests: Budget; chars: Budget; context?: Budget }
+  progress?: WorkProgress | null
   sources: { id: string; path: string; sha256: string; lines: number }[]
   plan: string
   notes: { round: number; title?: string; text: string; complete: boolean }[]
@@ -340,8 +359,10 @@ export type Chat = {
   updated_at: string
   transcript: TranscriptItem[]
   context_messages: number
-  assistant_status?: 'running' | 'paused' | 'complete' | 'incomplete' | 'budget_exhausted'
-  assistant_budget?: { tokens: Budget; seconds: Budget }
+  assistant_status?: 'running' | 'paused' | 'complete' | 'incomplete' | 'budget_exhausted' | 'failed'
+  assistant_resumable?: boolean
+  assistant_budget?: AssistantBudget
+  assistant_progress?: WorkProgress | null
 }
 
 export type StreamChunk = {
@@ -454,7 +475,7 @@ export const api = {
   cancelQueued: (task: string) => post<{ task: TaskSummary }>(`/api/queue/${task}/cancel`),
   route: (id: string, content: string, files: string[], mode_call?: { mode: RouteMode; start: number }) => post<{ ok: boolean }>(`/api/chats/${id}/route`, { content, files, mode_call }),
   resumeAssistant: (id: string) => post<{ task: TaskSummary }>(`/api/chats/${id}/assistant/resume`),
-  startRoute: (id: string, index: number, body: { mode: string; request: string; files: string[]; limits?: Record<string, number> }) =>
+  startRoute: (id: string, index: number, body: { mode: string; request: string; files: string[]; limits?: Record<string, number | null> }) =>
     post<{ task: TaskSummary }>(`/api/chats/${id}/routes/${index}/start`, body),
   cancelRoute: (id: string, index: number) => post<{ task: TaskSummary }>(`/api/chats/${id}/routes/${index}/cancel`),
   dismissRoute: (id: string, index: number) => post<{ item: TranscriptItem }>(`/api/chats/${id}/routes/${index}/dismiss`),

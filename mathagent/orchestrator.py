@@ -9,12 +9,14 @@ Worker results are evidence with their own status, never proof certificates.
 import copy
 import hashlib
 import json
+import math
 import re
 import threading
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 
 from .agent import AgentError
+from .call_policy import CallContextError, allocate_call
 from .router import EFFORTS, JOB_MODES, TASK_SCHEMA
 from .tools import schema
 from .refcheck import simple_standard_reference_request
@@ -46,6 +48,11 @@ quick_review checks a given proof (verdict, located issues); explain explains a 
 its proof; referee reviews a whole manuscript (overview, typos), detailed_review also checks its
 proofs and is only for an explicit request. For a numbered result of an attached file, delegate at
 once with the file and its name (e.g. "Lemma 3.2"); the worker finds it, so do not search first.
+For an attached article's main results, overview or author-claimed novelty, use explore
+with the source file; explain is for one specified result and its proof. Do not spend
+the whole action allowance reading a paper in sequential 100-line excerpts. Start
+with its introduction, results and relevant headings, then read only needed passages.
+Separate the authors' novelty claims from independently verified literature comparisons.
 Use check to find a useful standard reference for a known result, or to verify a
 citation or an explicitly requested precise locator. Ordinary reference requests
 get ONE bounded lookup: a standard book or paper, optionally a remembered chapter,
@@ -108,8 +115,7 @@ STATE_VERSION = 1
 # a synthesis. The model stops early when it only chooses an action.
 MAIN_PREDICT = 8192
 FINAL_PREDICT = 8192
-MAX_FINAL_PREDICT = 16384
-DEFAULT_ACTIONS = 12
+DEFAULT_ACTIONS = None
 
 
 def _ends_with_work_plan(text):
@@ -154,11 +160,11 @@ class Orchestrator:
     """
 
     def __init__(self, agent, delegate, emit=None, checkpoint=None,
-                 max_actions=DEFAULT_ACTIONS, max_children=4, concurrency=2):
-        if type(max_actions) is not int or max_actions < 0:
-            raise ValueError('max_actions must be a nonnegative integer')
-        if type(max_children) is not int or max_children < 0:
-            raise ValueError('max_children must be a nonnegative integer')
+                 max_actions=DEFAULT_ACTIONS, max_children=None, concurrency=2):
+        if max_actions is not None and (type(max_actions) is not int or max_actions < 0):
+            raise ValueError('max_actions must be null or a nonnegative integer')
+        if max_children is not None and (type(max_children) is not int or max_children < 0):
+            raise ValueError('max_children must be null or a nonnegative integer')
         if type(concurrency) is not int or not 1 <= concurrency <= 4:
             raise ValueError('concurrency must be an integer between 1 and 4')
         self.agent, self.delegate = agent, delegate
@@ -191,6 +197,11 @@ class Orchestrator:
         self._save()
         return self._result()
 
+    def conversation_history(self):
+        """Persist exact old transactions, not just their current working index."""
+        prefix = self.state.get('history_prefix_count', len(self.state['history']))
+        return copy.deepcopy(self.state['history'] + self.state['messages'][prefix:])
+
     def _new_state(self, query, files, history):
         if not isinstance(query, str) or not query.strip():
             raise ValueError('Provide a nonempty user message')
@@ -211,14 +222,43 @@ class Orchestrator:
             'version': STATE_VERSION, 'id': 'assistant_' + uuid.uuid4().hex,
             'status': 'running', 'query': query,
             'files': list(files), 'history': original,
-            'messages': copy.deepcopy(original) + [{'role': 'user', 'content': content}],
+            'messages': self._working_history(original) + [{'role': 'user', 'content': content}],
             'children': [], 'pending_calls': [], 'actions': 0, 'main_calls': 0,
             'answer': '', 'warnings': [], 'last_call': None, 'blockers': [], 'force_final': False,
             'empty_final_retried': False,
             'continuation_final_retried': False,
+            'tool_cache': {}, 'observed_results': [], 'stagnant_actions': 0,
             'limits': {'actions': self.max_actions, 'children': self.max_children,
                        'concurrency': self.concurrency},
         }
+        self.state['history_prefix_count'] = len(self.state['messages']) - 1
+
+    @staticmethod
+    def _working_history(history):
+        """Keep human premises and written answers; archive prior tool payloads.
+
+        Exact native history remains in the checkpoint and is retrievable by
+        read_conversation. This is source navigation, not a model summary.
+        """
+        messages, archived = [], []
+        for index, original in enumerate(history):
+            item = copy.deepcopy(original)
+            if item['role'] == 'tool' or (item['role'] == 'assistant' and len(item.get('content', '').encode()) > 6000):
+                archived.append({'index': index, 'tool': item.get('tool_name'),
+                    'role': item['role'],
+                    'lines': len(item.get('content', '').splitlines()),
+                    'sha256': hashlib.sha256(item.get('content', '').encode()).hexdigest()})
+                continue
+            item.pop('tool_calls', None)
+            item.pop('thinking', None)
+            if item['role'] == 'user' or item.get('content', '').strip():
+                messages.append(item)
+        if archived:
+            messages.append({'role': 'assistant', 'content':
+                'ARCHIVED CONVERSATION SOURCES: earlier tool payloads and long assistant answers are saved verbatim. '
+                'Retrieve relevant exact evidence with read_conversation(index, start_line, end_line); '
+                'their omission here is not evidence that a claim was verified. Index: ' + json.dumps(archived)})
+        return messages
 
     def _restore(self, state, query, files):
         state = copy.deepcopy(state)
@@ -241,6 +281,9 @@ class Orchestrator:
         self.state.setdefault('force_final', False)
         self.state.setdefault('empty_final_retried', False)
         self.state.setdefault('continuation_final_retried', False)
+        self.state.setdefault('tool_cache', {})
+        self.state.setdefault('observed_results', [])
+        self.state.setdefault('stagnant_actions', 0)
         if not isinstance(self.state['blockers'], list):
             raise ValueError('Malformed assistant blockers')
 
@@ -278,25 +321,90 @@ class Orchestrator:
         if any(child['id'] == pending.get('child_id') and child['status'] == 'complete'
                for child in self.state['children']):
             return None
-        return self._blocked(pending['call']['function']['arguments'].get('mode'))
+        args = pending['call']['function']['arguments']
+        return self._blocked(args.get('mode'), self._delegate_target(args))
+
+    def _delegate_target(self, args):
+        from .source_tasks import _instruction_text
+        files = list(dict.fromkeys(self.state['files'] + args.get('files', [])))
+        text = _instruction_text(args.get('request', ''))
+        target = re.search(r'\b(theorem|theoreme|thm|lemma|lemme|lem|proposition|corollary|corollaire)\s*[:.]?\s*(\d+(?:\.\d+)*|[a-z])\b', text)
+        label = re.search(r'\\(?:ref|eqref)\{([^}]+)\}', args.get('request', ''))
+        if not files and target is None and label is None:
+            return None
+        canonical = None
+        if target:
+            kind = {'theoreme': 'theorem', 'thm': 'theorem', 'lemme': 'lemma', 'lem': 'lemma',
+                    'corollaire': 'corollary'}.get(target[1], target[1])
+            canonical = kind + ':' + target[2]
+        elif label:
+            canonical = 'label:' + label[1]
+        return hashlib.sha256(json.dumps([self._source_key(files), canonical],
+                                          ensure_ascii=False).encode()).hexdigest()
 
     def _tools(self):
         tools = [_delegate_schema(), schema('read_result',
             'Retrieve a previously delegated worker result without rerunning the worker.',
-            {'job_id': {'type': 'string'}}, ['job_id'])]
+            {'job_id': {'type': 'string'}}, ['job_id']), schema('read_conversation',
+            'Read complete lines from an exact archived previous conversation message. Preserve hypotheses and verify source evidence before relying on it.',
+            {'index': {'type': 'integer'}, 'start_line': {'type': 'integer'}, 'end_line': {'type': 'integer'}},
+            ['index', 'start_line', 'end_line'])]
         workspace = getattr(self.agent, 'workspace', None)
         if workspace is not None:
             tools.extend(copy.deepcopy(item) for item in workspace.schemas()
                          if item.get('function', {}).get('name') in READ_ONLY_TOOLS)
         return tools
 
+    def _action_room(self):
+        return self.max_actions is None or self.state['actions'] < self.max_actions
+
+    def _call_room(self):
+        return self.max_actions is None or self.state['main_calls'] < self.max_actions + 3
+
+    def _source_key(self, files):
+        workspace = getattr(self.agent, 'workspace', None)
+        values = []
+        for filename in sorted(files):
+            digest = None
+            if workspace is not None and hasattr(workspace, 'path'):
+                try:
+                    path = workspace.path(filename, pdf=True)
+                    workspace._readable(path)
+                    digest = hashlib.sha256(path.read_bytes()).hexdigest()
+                except (ValueError, OSError):
+                    pass
+            values.append([filename, digest])
+        return values
+
+    def _tool_key(self, name, args):
+        files = [args['path']] if name == 'read_file' and isinstance(args.get('path'), str) else self.state['files']
+        return hashlib.sha256(json.dumps([name, args, self._source_key(files)],
+                                        ensure_ascii=False, sort_keys=True).encode()).hexdigest()
+
+    def _has_findings(self):
+        if any(child['status'] == 'complete' for child in self.state['children']):
+            return True
+        for message in self.state['messages']:
+            if message.get('role') != 'tool' or message.get('tool_name') not in READ_ONLY_TOOLS - {'list_files'}:
+                continue
+            try:
+                result = json.loads(message.get('content', ''))
+            except (TypeError, ValueError):
+                continue
+            if isinstance(result, dict) and result and not result.get('error'):
+                if message['tool_name'] in ('read_file', 'search_text'):
+                    excerpt = result.get('source_excerpt')
+                    if (not isinstance(excerpt, str) or not excerpt.strip()
+                            or excerpt.lstrip().startswith(('Tool error:', 'No matches'))):
+                        continue
+                return True
+        return False
+
     def _payload(self, tools):
         last = self.state.get('last_call') or {}
         partial = last.get('partial') or {}
         capped = (last.get('stats') or {}).get('done_reason') == 'length'
-        has_results = any(child['status'] == 'complete' for child in self.state['children'])
-        has_results = has_results or any(m.get('role') == 'tool' and m.get('tool_name') in WEB_TOOLS
-                                        for m in self.state['messages'])
+        has_results = self._has_findings()
         recovery = ((capped and has_results and bool(partial.get('content', '').strip()) and not partial.get('tool_calls'))
                     or last.get('final_recovery') is True)
         if recovery or self.state.get('force_final'):
@@ -304,13 +412,13 @@ class Orchestrator:
         synthesis = not tools or has_results
         predict = FINAL_PREDICT if synthesis or capped else MAIN_PREDICT
         if recovery and type(last.get('output_limit')) is int:
-            predict = min(MAX_FINAL_PREDICT, max(predict, last['output_limit']))
+            predict = max(predict, last['output_limit'])
         if capped:
             previous = last.get('output_limit', (last.get('stats') or {}).get('eval_count', MAIN_PREDICT))
             if type(previous) is int and previous > 0:
-                predict = min(MAX_FINAL_PREDICT, max(predict, previous * 2))
+                predict = max(predict, previous * 2)
         remaining = getattr(self.agent.client, 'remaining_tokens', None)
-        if isinstance(remaining, (int, float)):
+        if isinstance(remaining, (int, float)) and math.isfinite(remaining):
             predict = min(predict, int(remaining))
         if predict <= 0:
             raise AgentError('The shared generated-token budget is exhausted')
@@ -364,25 +472,34 @@ class Orchestrator:
                 ' You may instead perform the promised next step with an available tool.' if tools else
                 ' No further tools are available: report confirmed references with their evidence '
                 'levels and clearly identify details that remain unconfirmed.')})
+        if not tools and (self.state.get('empty_final_retried') or not self.state['children']):
+            payload['messages'].append({'role': 'user', 'content':
+                'CONTROLLER FINAL ANSWER REQUEST: give a written answer to the original request now, '
+                'using the saved source excerpts and worker findings above. Tools are unavailable. '
+                'Do not emit a tool call or another reading plan. Identify which sources were only '
+                'partly read and what remains unverified. For an article, explain the main results '
+                'supported by those excerpts and distinguish author-claimed novelty from an '
+                'independent literature comparison. If the evidence is insufficient, say exactly '
+                'what could be established and what is missing.'})
         # Preserve every hypothesis. Refuse oversized input instead of dropping
         # old turns, slicing a statement or splitting a native tool transaction.
-        counter = getattr(self.agent.client, 'count_input_tokens', None)
-        count = counter(payload) if callable(counter) else None
-        if count is None:
-            # UTF-8 byte count is a conservative fallback, not bytes/3: maths,
-            # TeX and Unicode can tokenize much less compactly than prose.
-            count = len(json.dumps(payload['messages'], ensure_ascii=False).encode())
-            count += len(json.dumps(tools, ensure_ascii=False).encode())
-        if type(count) is not int or count < 0:
-            raise AgentError('Invalid model input token count')
-        room = self.agent.ctx - count - 512
-        if room <= 0:
-            raise AgentError('The full assistant context exceeds the model input budget. '
-                             'No mathematical context was truncated; increase context or use explicit source excerpts.')
-        payload['options']['num_predict'] = min(predict, room)
+        payload, allocation = allocate_call(self.agent.client, payload, predict,
+                                            explicit_cap=getattr(self.agent, 'document_output_cap', None))
+        if tools and self.state['actions'] > 0 and allocation['available_output_tokens'] < FINAL_PREDICT:
+            # Preserve enough physical room for a supported answer before a
+            # sequence of new source reads fills the working context entirely.
+            self.state['force_final'] = True
+            payload.pop('tools', None)
+            payload['messages'][0]['content'] += (
+                '\nFINAL ANSWER REQUIRED: the working context is nearly full. Use the exact saved '
+                'findings to answer now, identify unread or unresolved source obligations, and '
+                'do not claim an exhaustive reading or promise further work.')
+            payload, allocation = allocate_call(self.agent.client, payload, predict,
+                explicit_cap=getattr(self.agent, 'document_output_cap', None))
+        self.state['next_allocation'] = allocation
         if capped and type(previous) is int and payload['options']['num_predict'] <= previous:
-            raise AgentError('A longer replacement answer cannot fit the remaining output or context budget. '
-                             'The saved worker results remain available; no completed proof was rerun.')
+            raise CallContextError('A longer replacement answer cannot fit the remaining output or context budget. '
+                                   'The saved worker results remain available; change the request or limit before retrying.', allocation)
         return payload
 
     def _stream(self, payload):
@@ -395,7 +512,8 @@ class Orchestrator:
                                                  or previous.get('final_recovery') is True))
         self.state['last_call'] = {'status': 'running', 'partial': copy.deepcopy(assistant), 'stats': {},
                                    'output_limit': payload['options']['num_predict'], 'final_recovery': recovering,
-                                   'tools_enabled': bool(payload.get('tools'))}
+                                   'tools_enabled': bool(payload.get('tools')),
+                                   'allocation': copy.deepcopy(self.state.get('next_allocation'))}
         self._save()
         self.emit('start', '')
         try:
@@ -479,6 +597,12 @@ class Orchestrator:
             raise ValueError('Unknown worker mode')
         if args['effort'] not in EFFORTS:
             raise ValueError('Unknown worker effort')
+        if args['effort'] == 'poincare':
+            from .source_tasks import _instruction_text
+            human = [self.state['query']] + [m.get('content', '') for m in self.state['history'] if m.get('role') == 'user']
+            if not any(re.search(r'poincar[eé]|\b(?:maximum|maximal|max) effort\b|\beffort (?:maximal|maximum)\b', text, re.I)
+                       for text in map(_instruction_text, human)):
+                raise ValueError('Poincaré effort requires the user to request maximum effort; fix the failed operation instead of escalating its label.')
         for key, maximum in (('request', 8000), ('reason', 400)):
             if not isinstance(args[key], str) or not args[key].strip() or len(args[key]) > maximum:
                 raise ValueError(f'{key} must be nonempty text of at most {maximum} characters; no text was truncated')
@@ -497,17 +621,28 @@ class Orchestrator:
         child = next((item for item in self.state['children'] if item['id'] == pending['child_id']), None)
         if child is not None:
             return child
+        source_key = self._source_key(list(dict.fromkeys(self.state['files'] + args['files'])))
+        request = ' '.join(args['request'].split()).casefold()
+        duplicate = next((item for item in self.state['children'] if item['status'] == 'complete'
+                          and item['action']['mode'] == args['mode']
+                          and ' '.join(item['action']['request'].split()).casefold() == request
+                          and item.get('source_key', [] if not item['action']['files'] else None) == source_key), None)
+        if duplicate is not None:
+            pending['child_id'] = duplicate['id']
+            pending['cached'] = True
+            return duplicate
         if (args['mode'] == 'check' and simple_standard_reference_request(self.state['query'])
                 and any(c['action']['mode'] == 'check' for c in self.state['children'])):
             raise ValueError('One standard-reference lookup has already been started for this request. '
                              'Answer from its results with uncertainty; optional exact locators do not require another worker.')
-        if len(self.state['children']) >= self.max_children:
+        if self.max_children is not None and len(self.state['children']) >= self.max_children:
             raise ValueError('The assistant child budget is exhausted')
         # Preserve the source request independently of the model's objective.
         # Messages include relevant file excerpts and earlier worker findings.
         child = {
             'id': 'child_' + uuid.uuid4().hex, 'job_id': None, 'status': 'pending',
             'action': copy.deepcopy(args), 'result': None,
+            'source_key': source_key,
             'context': {'query': self.state['query'], 'history': copy.deepcopy(self.state['history']),
                         'files': copy.deepcopy(self.state['files']),
                         'messages': copy.deepcopy(self.state['messages'][:-1])},
@@ -524,11 +659,11 @@ class Orchestrator:
         if emit_tool:
             self.emit('tool', name + ' ' + json.dumps(args, ensure_ascii=False))
         if name == 'delegate':
-            blocker = self._delegate_blocker(pending)
-            if blocker:
-                return self._blocked_result(blocker)
             try:
                 self._validate_delegate(args)
+                blocker = self._delegate_blocker(pending)
+                if blocker:
+                    return self._blocked_result(blocker)
                 child = self._child(pending, args)
             except (ValueError, TypeError, OSError) as exc:
                 return {'error': str(exc), 'status': 'invalid_action'}
@@ -550,11 +685,29 @@ class Orchestrator:
                     child['result'] = copy.deepcopy(value)
                     child['job_id'] = value.get('job_id') or child['job_id'] or child['id']
                     child['status'] = 'complete'
-                    self._record_blocker(child['action']['mode'], value)
+                    self._record_blocker(child['action']['mode'], value, self._delegate_target(child['action']))
                     self._save()
             return {'job_id': child['job_id'], 'child_id': child['id'], 'mode': child['action']['mode'],
                     'result': copy.deepcopy(child['result'])}
         try:
+            if name == 'read_conversation':
+                if set(args) != {'index', 'start_line', 'end_line'} or any(type(v) is not int for v in args.values()):
+                    raise ValueError('read_conversation requires integer index, start_line and end_line')
+                index, start, end = args['index'], args['start_line'], args['end_line']
+                if not 0 <= index < len(self.state['history']) or not 1 <= start <= end:
+                    raise ValueError('Invalid archived conversation range')
+                record = self.state['history'][index]
+                lines = record.get('content', '').splitlines()
+                if start > len(lines) or end > len(lines) or end - start >= 200:
+                    raise ValueError('Read an existing range of at most 200 complete lines')
+                key = self._tool_key(name, args)
+                if key in self.state['tool_cache']:
+                    pending['cached'] = True
+                    return copy.deepcopy(self.state['tool_cache'][key])
+                value = {'index': index, 'role': record['role'], 'start_line': start, 'end_line': end,
+                         'source_excerpt': '\n'.join(f'{n}: {lines[n-1]}' for n in range(start, end+1))}
+                self.state['tool_cache'][key] = value
+                return value
             if name == 'read_result':
                 if set(args) != {'job_id'} or not isinstance(args['job_id'], str) or not args['job_id']:
                     raise ValueError('read_result requires a nonempty job_id')
@@ -572,6 +725,12 @@ class Orchestrator:
                                if item['function']['name'] == name)
                 if set(args) - set(allowed['properties']) or set(allowed['required']) - set(args):
                     raise ValueError('Invalid read-only workspace arguments')
+                # Global discovery can change when another allowed file changes.
+                # Exact read_file calls are keyed by that source's content hash.
+                cache_key = None if name in ('list_files', 'search_text') else self._tool_key(name, args)
+                if cache_key is not None and cache_key in self.state['tool_cache']:
+                    pending['cached'] = True
+                    return copy.deepcopy(self.state['tool_cache'][cache_key])
                 if name in WEB_TOOLS:
                     if isinstance(pending.get('result'), dict):
                         return copy.deepcopy(pending['result'])
@@ -592,8 +751,13 @@ class Orchestrator:
                     pending['result'] = copy.deepcopy(result)
                     self._record_blocker(name, result, target)
                     self._save()
+                    if cache_key is not None:
+                        self.state['tool_cache'][cache_key] = copy.deepcopy(result)
                     return result
-                return {'source_excerpt': workspace.execute(name, args)}
+                result = {'source_excerpt': workspace.execute(name, args)}
+                if cache_key is not None:
+                    self.state['tool_cache'][cache_key] = copy.deepcopy(result)
+                return result
             raise ValueError('Unknown or forbidden main-agent tool: ' + name)
         except (ValueError, TypeError, OSError) as exc:
             # A malformed model action has no effects and becomes explicit
@@ -609,18 +773,18 @@ class Orchestrator:
             function = pending['call']['function']
             self.emit('tool', function['name'] + ' ' + json.dumps(function['arguments'], ensure_ascii=False))
             if pending['status'] == 'pending':
-                if not allow_tools or self.state['actions'] >= self.max_actions:
+                if not allow_tools or not self._action_room():
                     results[index] = {'error': 'The assistant action budget is exhausted',
                                       'status': 'budget_exhausted'}
                     continue
                 self.state['actions'] += 1
                 pending['status'] = 'running'
             try:
+                self._validate_delegate(function['arguments'])
                 blocker = self._delegate_blocker(pending)
                 if blocker:
                     results[index] = self._blocked_result(blocker)
                     continue
-                self._validate_delegate(function['arguments'])
                 self._child(pending, function['arguments'])
             except (ValueError, TypeError, OSError) as exc:
                 results[index] = {'error': str(exc), 'status': 'invalid_action'}
@@ -662,7 +826,7 @@ class Orchestrator:
             if pending['status'] == 'complete':
                 continue
             if pending['status'] == 'pending':
-                if not allow_tools or self.state['actions'] >= self.max_actions:
+                if not allow_tools or not self._action_room():
                     result = {'error': 'The assistant action budget is exhausted', 'status': 'budget_exhausted'}
                     self._append_result(pending, result)
                     continue
@@ -679,7 +843,39 @@ class Orchestrator:
                    'tool_call_id': pending['call']['id'], 'content': json.dumps(result, ensure_ascii=False)}
         self.state['messages'].append(message)
         pending['status'] = 'complete'
+        outcome = result.get('result', result)
+        substantive = {key: value for key, value in outcome.items() if key not in
+                       ('job_id', 'child_id', 'artifact', 'progress')}
+        digest = hashlib.sha256(json.dumps(substantive, ensure_ascii=False, sort_keys=True).encode()).hexdigest()
+        progressed = (not pending.get('cached') and digest not in self.state['observed_results']
+                      and not outcome.get('error') and outcome.get('status') not in
+                      ('invalid_action', 'blocked', 'failed', 'error', 'budget_violation', 'budget_exhausted')
+                      and not str(result.get('source_excerpt', '')).startswith('Tool error'))
+        self.state['stagnant_actions'] = 0 if progressed else self.state['stagnant_actions'] + 1
+        if digest not in self.state['observed_results']:
+            self.state['observed_results'].append(digest)
+        if self.state['stagnant_actions'] >= 3:
+            self.state['force_final'] = True
+            self._warning('The recent operations did not add usable findings. Giving the supported answer and unresolved points now.')
         value = result.get('result') or {}
+        error = value.get('error') if isinstance(value, dict) else None
+        if (isinstance(error, dict) and error.get('retryable') is False
+                and error.get('scope') == 'execution'):
+            self.state['force_final'] = True
+            self._warning('The selected operation cannot continue with unchanged inputs. Reporting saved findings and the concrete blocker.')
+        if (self.state.get('required_mode') in ('explain', 'quick_review', 'referee', 'detailed_review', 'literature', 'writeup')
+                and result.get('mode') == self.state['required_mode'] and isinstance(value, dict)):
+            # An explicit document request has one durable reading/checking plan.
+            # Synthesize its saved result, including pending coverage, instead
+            # of starting another whole-manuscript scan in the parent.
+            self.state['force_final'] = True
+        if (self.state.get('automatic_source_mode') == 'explore'
+                and isinstance(value, dict) and value.get('source_excerpt')
+                and result.get('mode') == 'explore'):
+            # A broad article worker already supplies its selected source packet.
+            # Synthesize it now, including limitations; restarting a sequential
+            # manuscript scan defeats that bounded reading plan.
+            self.state['force_final'] = True
         if (isinstance(value, dict) and value.get('disposition') == 'answer_with_qualification'
                 and simple_standard_reference_request(self.state['query'])
                 and all(c['action']['mode'] == 'check' for c in self.state['children'])):
@@ -721,7 +917,7 @@ class Orchestrator:
             self._new_state(query, files, history)
         else:
             self._restore(state, query, files)
-            if self.state['status'] == 'complete':
+            if self.state['status'] in ('complete', 'failed'):
                 return self._result()
         self.state['status'] = 'running'
         self._save()
@@ -729,13 +925,26 @@ class Orchestrator:
             last = self.state.get('last_call') or {}
             self._complete_pending(allow_tools=last.get('tools_enabled') is not False
                                    and last.get('final_recovery') is not True)
+            # Old reading loops could use every call without retrying their empty
+            # final answer. Permit one saved final-only rescue, without resetting
+            # actions, usage or the original limits.
+            final_rescue = (self.max_actions is not None and self.state['main_calls'] >= self.max_actions + 3
+                            and not self.state.get('empty_final_retried')
+                            and self._has_findings()
+                            and not (last.get('partial') or {}).get('content', '').strip())
+            if final_rescue:
+                self.state['empty_final_retried'] = True
+                self.state['force_final'] = True
+                self._warning('Recovering one final answer from the saved source readings; no source work is repeated.')
+                self._save()
             # Each tool round consumes >=1 action. Final synthesis and bounded
             # empty/continuation recovery may follow; bad peers remain bounded.
-            while self.state['main_calls'] < self.max_actions + 3:
+            while self._call_room() or final_rescue:
+                final_rescue = False
                 qualified = self._qualified_reference_answer()
                 if qualified is not None:
                     return qualified
-                tools = self._tools() if self.state['actions'] < self.max_actions else []
+                tools = self._tools() if self._action_room() else []
                 payload = self._payload(tools)
                 tools_enabled = bool(payload.get('tools'))
                 assistant, warning = self._stream(payload)
@@ -751,14 +960,15 @@ class Orchestrator:
                     continue
                 self.state['messages'].append(assistant)
                 if not assistant['content'].strip():
-                    if any(child['status'] == 'complete' for child in self.state['children']) and not self.state['empty_final_retried']:
+                    if not self.state['empty_final_retried']:
                         self.state['empty_final_retried'] = True
                         self.state['force_final'] = True
                         self.state['last_call']['status'] = 'incomplete'
-                        self._warning('The final answer was empty; retrying synthesis once from the saved worker results.')
+                        self._warning('The final answer was empty; retrying once from the saved conversation and source findings.')
                         self._save()
                         continue
-                    return self._finish('incomplete', warning='No final answer was received.')
+                    return self._finish('failed', warning='The model returned no final answer after one recovery attempt. '
+                                        'The sources and work are saved; start a new request rather than repeating Resume.')
                 if _ends_with_work_plan(assistant['content']):
                     self.state['last_call']['status'] = 'incomplete'
                     if not self.state['continuation_final_retried']:
@@ -768,12 +978,14 @@ class Orchestrator:
                         continue
                     return self._finish('incomplete', assistant['content'],
                         'The reply still promises further work without an answer. Work is saved and can be resumed.')
-                self.agent.history = copy.deepcopy(self.state['messages'])
+                self.agent.history = self.conversation_history()
                 for item in self.agent.history:
                     item.pop('thinking', None)
                 return self._finish('complete', assistant['content'])
-            return self._finish('incomplete', warning='The assistant call budget is exhausted; work remains unfinished.')
+            return self._finish('failed', warning='The assistant call budget is exhausted; work remains unfinished. '
+                                'The saved work is available for a new request.')
         except BaseException as exc:
-            self.state['status'] = 'interrupted' if isinstance(exc, KeyboardInterrupt) else 'incomplete'
+            self.state['status'] = ('interrupted' if isinstance(exc, KeyboardInterrupt) else
+                                    'failed' if isinstance(exc, CallContextError) else 'incomplete')
             self._save()
             raise

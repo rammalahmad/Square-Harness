@@ -46,6 +46,15 @@ test('only paused Assistant turns are resumable', () => {
   assert.equal(assistantResumable(null), false)
 })
 
+test('the backend can distinguish a recoverable pause from spent recovery', () => {
+  assert.equal(assistantResumable({ mode: 'free', assistant_status: 'paused', assistant_resumable: false }), false)
+  assert.equal(assistantResumable({ mode: 'free', assistant_status: 'paused', assistant_resumable: true }), true)
+  assert.equal(assistantResumable({ mode: 'free', assistant_status: 'running', assistant_resumable: true }), false)
+  assert.equal(assistantResumable({ mode: 'free', assistant_status: 'incomplete', assistant_resumable: true }), false)
+  assert.equal(assistantResumable({ mode: 'free', assistant_status: 'failed', assistant_resumable: true }), false)
+  assert.equal(assistantResumable({ mode: 'critic', assistant_status: 'paused', assistant_resumable: true }), false)
+})
+
 test('resumeAssistant targets the saved parent workflow without starting another child', async () => {
   const original = globalThis.fetch
   let call: { path: string; options?: RequestInit } | undefined

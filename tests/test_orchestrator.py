@@ -84,7 +84,7 @@ class OrchestratorTests(unittest.TestCase):
         runner, client = self.runner([final()])
         runner.run('Hello')
         names = {item['function']['name'] for item in client.requests[0]['tools']}
-        self.assertEqual(names, {'delegate', 'read_result', 'list_files', 'read_file', 'search_text'})
+        self.assertEqual(names, {'delegate', 'read_result', 'read_conversation', 'list_files', 'read_file', 'search_text'})
         self.assertNotIn('write_file', names)
         self.assertNotIn('run_python', names)
 
@@ -189,7 +189,7 @@ class OrchestratorTests(unittest.TestCase):
         runner.agent.ctx = 8192
         history = [{'role': 'user', 'content': 'uniform ' * 3000}]
         query = 'At the critical time T, retain all the preceding hypotheses.'
-        with self.assertRaisesRegex(AgentError, 'No mathematical context was truncated'):
+        with self.assertRaisesRegex(AgentError, 'No hypotheses'):
             runner.run(query, history=history)
         self.assertEqual(client.requests, [])
         self.assertEqual(runner.state['history'], history)
@@ -655,10 +655,11 @@ class OrchestratorTests(unittest.TestCase):
         self.assertEqual(len(client.requests), 2)
 
     def test_new_turn_allows_lookup_beyond_six_actions(self):
-        runner, client = self.runner([calls(*(call('list_files', {}, str(i)) for i in range(6))),
-                                     calls(call('list_files', {}, 'seventh')), final()])
+        (self.root / 'notes.txt').write_text('\n'.join('Evidence ' + str(i) for i in range(14)))
+        runner, client = self.runner([calls(call('read_file', {'path': 'notes.txt', 'start_line': i, 'end_line': i}, str(i)))
+                                     for i in range(1, 15)] + [final()])
         result = runner.run('Inspect sources.')
-        self.assertEqual(result['actions'], 7)
+        self.assertEqual(result['actions'], 14)
         self.assertEqual(result['status'], 'complete')
         self.assertIn('tools', client.requests[1])
 
@@ -719,12 +720,12 @@ class OrchestratorTests(unittest.TestCase):
     def test_repeated_empty_synthesis_is_bounded_across_resume(self):
         runner, client = self.runner([calls(call(args=action(mode='prove'))), final(''), final(''), final('')])
         result = runner.run('Prove the original statement.')
-        self.assertEqual(result['status'], 'incomplete')
+        self.assertEqual(result['status'], 'failed')
         self.assertEqual(len(client.requests), 3)
         resumed = Orchestrator(runner.agent, runner.delegate)
         result = resumed.run('Prove the original statement.', state=runner.state)
-        self.assertEqual(result['status'], 'incomplete')
-        self.assertEqual(len(client.requests), 4)
+        self.assertEqual(result['status'], 'failed')
+        self.assertEqual(len(client.requests), 3)
         self.assertEqual(len(self.children), 1)
 
     def test_post_worker_full_answer_has_room_and_retains_adaptive_tools(self):
@@ -854,6 +855,7 @@ class OrchestratorTests(unittest.TestCase):
 
     def test_recovery_does_not_repeat_maximum_capped_allowance(self):
         runner, client = self._capped_proof(following=[final('Still cut off', reason='length', eval_count=16384)])
+        runner.agent.document_output_cap = 16384  # An explicit user ceiling stays strict.
         first_retry = Orchestrator(runner.agent, runner.delegate)
         first = first_retry.run('Prove E under H1 and H2.', state=runner.state)
         self.assertEqual(first['status'], 'incomplete')

@@ -149,15 +149,17 @@ def parser():
     p.add_argument('--top-p', type=float, default=0.95)
     p.add_argument('--ctx', type=int, default=40960)
     p.add_argument('--predict', type=int, default=4096,
-                   help='Ordinary-chat output limit, including thinking; proof has separate limits')
+                   help='Ordinary-chat output limit, including thinking; specialist workflows allocate output separately')
+    p.add_argument('--specialist-output-tokens', type=int,
+                   help='Optional explicit output cap per specialist model call, including thinking (default: phase and physical context)')
     p.add_argument('--max-rounds', type=int, default=8, help='Tool rounds per ordinary chat query (not proof rounds)')
     p.add_argument('--assistant-concurrency', type=int, default=2,
                    help='Simultaneous Assistant workers on vLLM/OpenAI-compatible servers (1–4; other backends use 1)')
-    p.add_argument('--assistant-tokens', type=int, help='Hard shared generated-token ceiling (default: adaptive to worker effort, 60000–200000)')
-    p.add_argument('--assistant-input-tokens', type=int, help='Hard shared input-token ceiling (default: adaptive to worker effort, 240000–800000)')
+    p.add_argument('--assistant-tokens', type=int, help='Optional hard shared generated-token ceiling (default: no cumulative ceiling)')
+    p.add_argument('--assistant-input-tokens', type=int, help='Optional hard shared input-token ceiling (default: no cumulative ceiling)')
     p.add_argument('--assistant-seconds', type=float, help='Hard shared active-time ceiling (default: adaptive to worker effort, 900–7200 seconds)')
     p.add_argument('--proof-rounds', type=int, default=3, help='Maximum proof attempts, including the initial solve and revisions')
-    p.add_argument('--proof-tokens', type=int, default=120000, help='Total generated-token ceiling, including all thinking and verification')
+    p.add_argument('--proof-tokens', type=int, help='Optional cumulative generated-token ceiling, including thinking and verification (default: no cumulative ceiling)')
     p.add_argument('--proof-seconds', type=float, default=1800, help='Time budget in seconds per new proof')
     p.add_argument('--proof-solve-tokens', type=int, default=32768,
                    help='Output ceiling for each full solve or revision, including thinking')
@@ -166,7 +168,7 @@ def parser():
     p.add_argument('--proof-repair-tokens', type=int, default=None,
                    help='Output ceiling for each repair/later attempt, including thinking (default: solve tokens)')
     p.add_argument('--proof-min-solve-tokens', type=int, default=None,
-                   help='Smallest output allowance for a repair/continuation fitted to the context (default: min(16384, solve tokens))')
+                   help='Explicit useful output floor for solving, repair and continuation (default: 128; incomplete output is never accepted)')
     p.add_argument('--proof-verify-temperature', type=float, default=None,
                    help='Verifier sampling temperature (default: --temperature)')
     p.add_argument('--proof-file', action='append', default=[], metavar='PATH',
@@ -178,8 +180,8 @@ def parser():
     p.add_argument('--template-file', action='append', default=[], metavar='PATH',
                    help='Write-up template (.sty, .cls, .tex or .bib) whose macros and style must be used; repeatable')
     p.add_argument('--research-rounds', type=int, default=6, help='Maximum investigation rounds per new report')
-    p.add_argument('--research-tokens', type=int, default=24000, help='Total generated-token budget per new report')
-    p.add_argument('--research-input-tokens', type=int, default=100000, help='Cumulative input-token budget per new report')
+    p.add_argument('--research-tokens', type=int, help='Optional cumulative generated-token ceiling per report (default: no cumulative ceiling)')
+    p.add_argument('--research-input-tokens', type=int, help='Optional cumulative input-token ceiling per report (default: no cumulative ceiling)')
     p.add_argument('--research-seconds', type=float, default=900, help='Total time budget per new report')
     p.add_argument('--research-requests', type=int, default=12, help='Maximum external HTTP requests per new research or assisted-proof job')
     p.add_argument('--research-chars', type=int, default=30000, help='Maximum literature-tool response characters per job')
@@ -248,7 +250,9 @@ def main():
         p.error('Use assistant-concurrency 1–4, assistant token budgets >= 4096, and finite assistant-seconds > 0')
     if args.ctx < 2048 or not 0 < args.predict < args.ctx - 1024 or not 1 <= args.max_rounds <= 32:
         p.error('Use ctx >= 2048, 0 < predict < ctx - 1024, and 1 <= max-rounds <= 32')
-    if (not 1 <= args.proof_rounds <= 100 or args.proof_tokens < 512
+    if args.specialist_output_tokens is not None and args.specialist_output_tokens < 128:
+        p.error('Use specialist-output-tokens >= 128')
+    if (not 1 <= args.proof_rounds <= 100 or args.proof_tokens is not None and args.proof_tokens < 512
             or not math.isfinite(args.proof_seconds) or args.proof_seconds <= 0
             or args.proof_solve_tokens < 128 or args.proof_verify_tokens < 128):
         p.error('Use proof-rounds 1–100, proof-tokens >= 512, finite proof-seconds > 0, and solve/verify limits >= 128')
@@ -259,8 +263,8 @@ def main():
     if args.proof_verify_temperature is not None and (not math.isfinite(args.proof_verify_temperature)
                                                       or not 0 <= args.proof_verify_temperature <= 2):
         p.error('--proof-verify-temperature must be between 0 and 2')
-    if (not 1 <= args.research_rounds <= 50 or args.research_tokens < 1024
-            or args.research_input_tokens < 2048 or not math.isfinite(args.research_seconds)
+    if (not 1 <= args.research_rounds <= 50 or args.research_tokens is not None and args.research_tokens < 1024
+            or args.research_input_tokens is not None and args.research_input_tokens < 2048 or not math.isfinite(args.research_seconds)
             or args.research_seconds <= 0 or not 0 <= args.research_requests <= 100
             or not 1000 <= args.research_chars <= 1_000_000):
         p.error('Use research-rounds 1–50, research-tokens >= 1024, research-input-tokens >= 2048, positive finite research-seconds, research-requests 0–100, and research-chars 1000–1000000')
@@ -298,6 +302,7 @@ def main():
         agent = Agent(client, workspace, args.model, args.ctx, args.predict,
                       not args.no_think, args.mode, args.max_rounds,
                       seed=args.seed, temperature=args.temperature, top_p=args.top_p)
+        agent.document_output_cap = args.specialist_output_tokens
     except (AgentError, OSError, ValueError) as e:
         ui.say(str(e))
         return 2
@@ -392,9 +397,7 @@ def main():
         if agent.mode == 'prove':
             if args.output:
                 raise ValueError('--output is for literature/referee reports; proof reports save automatically')
-            if max(args.proof_solve_tokens, args.proof_verify_tokens) + 256 >= agent.ctx:
-                raise ValueError('Proof context must exceed each solve/verify output limit plus room for the input')
-            if args.proof_tokens < args.proof_solve_tokens + args.proof_verify_tokens:
+            if args.proof_tokens is not None and args.proof_tokens < args.proof_solve_tokens + args.proof_verify_tokens:
                 raise ValueError('--proof-tokens must cover one full solve and verification; reduce their explicit limits or raise the total')
             unpinned = unpinned_files(query)
             if unpinned:

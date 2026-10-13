@@ -163,6 +163,8 @@ class ReviewTestCase(unittest.TestCase):
         workspace = Workspace(self.root)
         workspace.literature = None
         agent = Agent(client, workspace, ctx=ctx, predict=predict)
+        if predict != 4096:  # these fixtures deliberately exercise an explicit specialist cap
+            agent.document_output_cap = predict
         agent.seed = 7
         return agent
 
@@ -278,7 +280,7 @@ class QuickTests(ReviewTestCase):
             runner = QuickReviewRunner(self.agent(client), concurrency=concurrency)
             runner.start(WRONG, max_rounds=10)
             self.assertEqual(len(runner.state['checks']), 5)
-            self.assertLessEqual(runner.state['tokens_charged'], runner.state['settings']['max_tokens'])
+            self.assertIsNone(runner.state['settings']['max_tokens'])
             drafts.append(runner.state['draft'])
         self.assertEqual(drafts[0], drafts[1])
 

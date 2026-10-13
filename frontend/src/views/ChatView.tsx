@@ -2,7 +2,8 @@ import { useEffect, useLayoutEffect, useRef, useState, type FormEvent, type Keyb
 import { api, type LiveTurn, type RouteMode, type TranscriptItem } from '../api'
 import { capacityFull, chatWork, taskById } from '../concurrency'
 import { assistantResumable, routeActivity } from '../assistant'
-import { Collapse, ErrorNote, Loading, Toggle, useLoad } from '../components/common'
+import { assistantBudgetDisplay } from '../assistantBudget'
+import { Collapse, ErrorNote, Loading, Toggle, WorkProgressNote, useLoad } from '../components/common'
 import { CloseIcon, FileIcon, PauseIcon, PlayIcon, SendIcon } from '../components/Icons'
 import { EFFORTS, effortLimits, isLevel, type EffortKind } from '../components/Effort'
 import { Glyph } from '../components/Glyph'
@@ -11,7 +12,7 @@ import { callPayload, type ModeCall } from '../modeCalls'
 import { Inline, Markdown, StreamingMarkdown } from '../components/Markdown'
 import { proofLook, researchLook, Square, type Variant } from '../components/Square'
 import { useDropTarget } from '../drop'
-import { ago, count, duration } from '../format'
+import { ago, count } from '../format'
 import { MODES } from '../modes'
 import { go, href } from '../router'
 import { useApp, useTick } from '../store'
@@ -112,6 +113,7 @@ export function ChatView({ mode, id }: { mode: ChatMode; id: string | null }) {
   }, [data, liveSize, routing])
 
   const free = mode === 'free'
+  const budgetDisplay = data?.assistant_budget ? assistantBudgetDisplay(data.assistant_budget) : null
   const paused = free && assistantResumable(data)
   const send = async (text?: string) => {
     const raw = text ?? draft
@@ -183,10 +185,14 @@ export function ChatView({ mode, id }: { mode: ChatMode; id: string | null }) {
             </div>
           )}
           {live && <LiveTurnView live={live} mode={mode} />}
+          {free && data?.assistant_progress && <div className="entry">
+            <span className="in-margin" />
+            <WorkProgressNote progress={data.assistant_progress} status={data.assistant_status || ''} running={ours} />
+          </div>}
           {free && assistantResumable(data) && !ours && (
             <div className="entry message message-model">
               <span className="in-margin speaker speaker-model mode-free">{MODES.free.glyph}</span>
-              <p className="notice">The assistant is paused. Resume with the remaining budget, or start a new conversation for another request.</p>
+              <p className="notice">The assistant is paused. Its work is saved; resume from where it stopped.</p>
             </div>
           )}
         </div>
@@ -235,10 +241,12 @@ export function ChatView({ mode, id }: { mode: ChatMode; id: string | null }) {
               <PlayIcon size={14} /> {resuming ? 'Resuming…' : 'Resume assistant'}
             </button>
           )}
-          {free && data?.assistant_budget && (
-            <span className="muted small" title="This conversation's allowance covers its assistant and focused tasks. Other conversations have their own budgets.">
-              {count(data.assistant_budget.tokens.used)} / {count(data.assistant_budget.tokens.limit)} tokens
-              {' · '}{duration(data.assistant_budget.seconds.used)} / {duration(data.assistant_budget.seconds.limit)}
+          {free && budgetDisplay && (
+            <span className="muted small" title={budgetDisplay.title}>
+              {budgetDisplay.output}
+              {budgetDisplay.reserved && <> {' · '}{budgetDisplay.reserved}</>}
+              {budgetDisplay.context && <> {' · '}{budgetDisplay.context}</>}
+              {' · '}{budgetDisplay.time}
             </span>
           )}
           {canReview && (
@@ -462,7 +470,7 @@ function RouteCard({ chatId, index, item }: { chatId: string; index: number; ite
         <div className="route-actions">
           {(queued || running) && (
             <button type="button" className="btn btn-small" disabled={acting || task?.state === 'pausing'}
-              title={queued ? 'Take it out of the queue' : item.orchestrated ? 'Pause the assistant and its current task; resume with the remaining budget' : 'Stop at the next checkpoint; the job is kept and can be resumed from its page'}
+              title={queued ? 'Take it out of the queue' : item.orchestrated ? 'Pause the assistant and its current task; their work is saved' : 'Stop at the next checkpoint; the job is kept and can be resumed from its page'}
               onClick={() => act(() => queued ? api.cancelQueued(item.task!) : item.orchestrated ? api.pause(item.task!) : api.cancelRoute(chatId, index))}>
               {item.orchestrated && running ? <PauseIcon size={14} /> : <CloseIcon size={14} />} {item.orchestrated && running ? 'Pause assistant' : 'Cancel'}
             </button>

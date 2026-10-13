@@ -1,4 +1,4 @@
-"""Solve, verify, and repair one proof, with immutable candidates and bounded cost.
+"""Solve, verify, and repair one proof, with immutable candidates and finite work.
 
 The controller enforces provenance and budgets. A model review is not a proof
 certificate, and preservation of an answer does not establish its correctness.
@@ -12,12 +12,24 @@ import time
 
 from .agent import AgentError
 from .backends import TokenBudgetError
+from .call_policy import CONTEXT_MARGIN, CallContextError, allocate_call, count_input
 from .ledger import LedgerError, ProofStore
 from .proof_policy import (
     CONTINUE_POLICY, REPAIR_POLICY, VERIFIER_SCHEMA, initial_request, review_request,
 )
 
-POLICY_VERSION = 7
+POLICY_VERSION = 8
+# Reviewed policy-7 transport at review HEAD a9ff7e4, and this migration's
+# compatible target. Unknown source changes never acquire inference permission.
+LEGACY_CONTROLLER_SHA256 = '721a53df9dad81ec0a165c0ff40fd9729c8536a40aa01b61c29c6ec6e0ce452d'
+LEGACY_TRANSPORT_SHA256 = {
+    'agent.py': '490a6dff6eecdfc182939a935099bb890dd1426e7ddcc1520390a04cf19c5a00',
+    'backends.py': '5fa0edbebbfb991b94033f677501b2697a85ec6101c89830614e8212262f3821',
+}
+COMPATIBLE_TRANSPORT_SHA256 = {
+    'agent.py': 'ee94911232b161db26798aaad3168d0f780a90befa01f5bb432920926f86ae2b',
+    'backends.py': '04e520784b297e2e97790bd383a9a9444fd67c93359f248676baf2a05c9e02f4',
+}
 TERMINAL = {'candidate_complete', 'budget_exhausted', 'budget_violation', 'attempts_exhausted',
             'uncertain', 'review_unavailable', 'needs_context', 'needs_recovery'}
 
@@ -66,31 +78,14 @@ def validate_review(text):
     return value
 
 
-def count_input(client, payload):
-    """Count the full request input; return (tokens, counting method). Never clips."""
-    counter = getattr(client, 'count_input_tokens', None)
-    count = counter(payload) if callable(counter) else None
-    if count is None:
-        # A conservative fallback avoids the former optimistic chars/3 guard.
-        # It can reject a request that an exact tokenizer would fit. Never clip.
-        count = len(json.dumps(payload['messages'], ensure_ascii=False).encode())
-        count += len(json.dumps(payload.get('format', {}), ensure_ascii=False).encode()) + 256
-        method = 'conservative UTF-8 byte estimate'
-    else:
-        if type(count) is not int or count < 0:
-            raise AgentError('Invalid exact input token count')
-        method = 'server token count'
-    return count, method
-
-
 def check_context(client, payload):
     """Check the full request without clipping; return the counting provenance."""
     cap = payload['options']['num_predict']
-    context = payload['options']['num_ctx']
-    count, method = count_input(client, payload)
-    if count + cap + 1 > context:
-        raise ProofContext(f'Full original statement and saved work need {count} input tokens ({method}) plus {cap} output tokens, exceeding context {context}. Nothing was clipped; candidate retained.')
-    return {'input_tokens': count, 'method': method}
+    try:
+        _, allocation = allocate_call(client, payload, cap, minimum=cap)
+    except CallContextError as exc:
+        raise ProofContext(str(exc) + ' Candidate retained.') from exc
+    return allocation
 
 
 class ProofRunner:
@@ -114,28 +109,32 @@ class ProofRunner:
             'policy_version': POLICY_VERSION,
             'policy_sha256': hashlib.sha256(Path(__file__).with_name('proof_policy.py').read_bytes()).hexdigest(),
             'controller_sha256': hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+            'allocation_policy_sha256': hashlib.sha256(Path(__file__).with_name('call_policy.py').read_bytes()).hexdigest(),
             'transport_sha256': {name: hashlib.sha256(Path(__file__).with_name(name).read_bytes()).hexdigest()
                                  for name in ('backends.py', 'agent.py')},
             'harness_version': '0.5.1',
         }
 
-    def start(self, goal, *, max_rounds=3, max_tokens=120000, max_seconds=1800,
+    def start(self, goal, *, max_rounds=3, max_tokens=None, max_seconds=1800,
               source_files=(), max_predict=32768, verify_tokens=16384,
               min_solve_tokens=None, verify_temperature=None, repair_tokens=None):
         if not isinstance(goal, str) or not goal.strip() or len(goal) > 60000:
             raise ValueError('Provide a nonempty proof goal, at most 60000 characters')
         for name, value, lower, upper in (
-            ('max_rounds', max_rounds, 1, 100), ('max_tokens', max_tokens, 128, 100000000),
+            ('max_rounds', max_rounds, 1, 100),
             ('max_predict', max_predict, 128, 1000000), ('verify_tokens', verify_tokens, 128, 1000000),
         ):
             if type(value) is not int or not lower <= value <= upper:
                 raise ValueError(f'{name} must be an integer between {lower} and {upper}')
+        if max_tokens is not None and (type(max_tokens) is not int or max_tokens < 128):
+            raise ValueError('max_tokens must be an integer >= 128 or null')
         if repair_tokens is None:
             repair_tokens = max_predict
         if type(repair_tokens) is not int or not 128 <= repair_tokens <= max_predict:
             raise ValueError('repair_tokens must be an integer between 128 and max_predict')
+        initial_min_solve_tokens = min_solve_tokens if min_solve_tokens is not None else 128
         if min_solve_tokens is None:
-            min_solve_tokens = min(16384, repair_tokens)
+            min_solve_tokens = 128
         if type(min_solve_tokens) is not int or not 128 <= min_solve_tokens <= repair_tokens:
             raise ValueError('min_solve_tokens must be an integer between 128 and repair_tokens')
         if verify_temperature is None:
@@ -156,6 +155,8 @@ class ProofRunner:
         settings = dict(self._provenance(), max_rounds=max_rounds, max_tokens=max_tokens,
                         max_seconds=max_seconds, max_predict=max_predict, verify_tokens=verify_tokens,
                         min_solve_tokens=min_solve_tokens, verify_temperature=verify_temperature,
+                        initial_min_solve_tokens=initial_min_solve_tokens,
+                        specialist_output_cap=getattr(self.agent, 'document_output_cap', None),
                         repair_tokens=repair_tokens)
         self.store = ProofStore.create(self.agent.workspace.root, goal, settings, sources)
         self.emit('notice', f'Proof {self.state["id"]}: solve, verify, repair if needed; up to {max_rounds} attempts, subject to budget')
@@ -175,9 +176,30 @@ class ProofRunner:
             setattr(self.agent, key, saved[key])
         if hasattr(self.agent.client, 'thinking_budget_policy'):
             self.agent.client.thinking_budget_policy = copy.deepcopy(saved['thinking_budget_policy'])
-        for key, current in self._provenance().items():
+        current_provenance = self._provenance()
+        legacy_policy = saved.get('policy_version') == 7
+        if legacy_policy and (saved.get('controller_sha256') != LEGACY_CONTROLLER_SHA256
+                              or saved.get('transport_sha256') != LEGACY_TRANSPORT_SHA256
+                              or current_provenance['transport_sha256'] != COMPATIBLE_TRANSPORT_SHA256):
+            raise ValueError('Cannot resume an unrecognized policy-7 controller or transport. Saved artifacts remain readable.')
+        for key, current in current_provenance.items():
+            if legacy_policy and key in ('policy_version', 'controller_sha256', 'allocation_policy_sha256', 'transport_sha256'):
+                continue
             if saved.get(key) != current:
                 raise ValueError(f'Cannot resume with changed {key}; use the original proof policy. Saved artifacts remain readable.')
+        if legacy_policy:
+            migration = {'from_policy': 7, 'to_policy': POLICY_VERSION,
+                         'original_controller_sha256': saved.get('controller_sha256'),
+                         'original_transport_sha256': copy.deepcopy(saved['transport_sha256']),
+                         'controller_sha256': current_provenance['controller_sha256'],
+                         'transport_sha256': copy.deepcopy(current_provenance['transport_sha256']),
+                         'allocation_policy_sha256': current_provenance['allocation_policy_sha256']}
+            if self.state.get('execution_migration') not in (None, migration):
+                raise ValueError('Cannot resume with a changed execution migration; saved artifacts remain readable.')
+            if 'execution_migration' not in self.state:
+                self.state['execution_migration'] = migration
+                with self.store.lock():
+                    self.store.save()
         return self._run()
 
     def _elapsed(self):
@@ -193,7 +215,8 @@ class ProofRunner:
         self.state['status'], self.state['stop_reason'] = status, reason
 
     def _remaining(self):
-        return self.state['settings']['max_tokens'] - self.state['tokens_charged']
+        limit = self.state['settings']['max_tokens']
+        return math.inf if limit is None else limit - self.state['tokens_charged']
 
     def _attempt_cap(self, kind):
         settings = self.state['settings']
@@ -307,7 +330,9 @@ class ProofRunner:
         if old_timeout is not None:
             client.timeout = max(0.1, min(old_timeout, self.state['settings']['max_seconds'] - self._elapsed()))
         try:
-            return count_input(client, self._payload('solver', messages, cap))[0]
+            payload = self._payload('solver', messages, cap)
+            payload['options'].pop('num_ctx', None)
+            return count_input(client, payload)[0]
         finally:
             if old_timeout is not None:
                 client.timeout = old_timeout
@@ -321,11 +346,11 @@ class ProofRunner:
             cap = min(cap, self._remaining() - settings['verify_tokens'])
         if pending['kind'] not in {'initial', 'retry'}:
             floor = settings.get('min_solve_tokens', cap)
-            count = self._count(messages, floor)
-            cap = min(cap, self.agent.ctx - count - 1)
-            if cap < floor:
-                raise ProofContext(f'The {pending["kind"]} request needs {count} input tokens; with context {self.agent.ctx} '
-                                   f'only {max(cap, 0)} output tokens remain, below the {floor}-token minimum. Nothing was clipped; candidates retained.')
+            try:
+                _, allocation = allocate_call(self.agent.client, self._payload('solver', messages, cap), cap, minimum=floor)
+            except CallContextError as exc:
+                raise ProofContext(str(exc) + ' Candidates retained.') from exc
+            cap = allocation['output_tokens']
         pending['solver_cap'] = cap
         return cap
 
@@ -351,8 +376,17 @@ class ProofRunner:
         solve of the original problem replaces the continuation.
         """
         goal, sources = self.state['goal'], self.state['sources']
-        notes = self._read_stream(self._find_call(prior['call'])['stream'])['thinking']
+        previous_call = self._find_call(prior['call'])
+        previous_result = self._read_stream(previous_call['stream'])
+        notes = previous_result['thinking']
+        length_limited = previous_result['stats'].get('done_reason') == 'length'
+        if length_limited and not text.strip() and not notes.strip():
+            raise ProofContext('The previous generation reached its output limit without reusable written text or working notes. '
+                               'Repeating the same allowance cannot advance this proof; its artifacts were retained.')
         floor, ctx = self.state['settings']['min_solve_tokens'], self.agent.ctx
+        observed_context = getattr(self.agent.client, 'observed_context_tokens', None)
+        if type(observed_context) is int and observed_context > 0:
+            ctx = min(ctx, observed_context)
 
         def build(tail):
             header = ('SAVED WORKING NOTES:\n' if len(tail) == len(notes) else
@@ -361,16 +395,31 @@ class ProofRunner:
             messages[0]['content'] += '\n\n' + CONTINUE_POLICY + '\n\nSAVED WRITTEN TEXT:\n' + text + '\n\n' + header + tail
             return messages
 
-        room = ctx - 1 - floor - self._count(build(''), floor) - 64
+        room = ctx - CONTEXT_MARGIN - floor - self._count(build(''), floor)
         if room > 0:
             keep = min(len(notes), int(room * 2.5))
             for _ in range(5):
                 tail = notes[len(notes) - keep:] if keep else ''
                 messages = build(tail)
-                if self._count(messages, floor) + floor + 1 <= ctx:
+                if self._count(messages, floor) + floor + CONTEXT_MARGIN <= ctx:
                     pending.update(notes_chars_kept=len(tail), notes_chars_total=len(notes))
                     return messages
                 keep = int(keep * 0.75)
+        if length_limited:
+            settings = self.state['settings']
+            desired = self._attempt_cap('retry')
+            desired = min(desired, self._remaining() - settings['verify_tokens'])
+            fresh = self._payload('solver', initial_request(goal, sources), desired)
+            try:
+                _, allocation = allocate_call(self.agent.client, fresh, desired,
+                    minimum=settings.get('initial_min_solve_tokens', settings['min_solve_tokens']),
+                    explicit_cap=settings.get('specialist_output_cap'))
+            except CallContextError as exc:
+                raise ProofContext(str(exc) + ' Saved candidate retained.') from exc
+            if allocation['output_tokens'] <= previous_call['reserved_tokens']:
+                raise ProofContext('Saved written work cannot fit a useful continuation, and a fresh solve would repeat '
+                                   'the same exhausted output allowance. The original problem, candidate and notes remain saved; '
+                                   'use a larger physical context or split the proof objective.')
         pending.update(kind='retry', continuation_fallback='fresh_solve',
                        notes_chars_kept=0, notes_chars_total=len(notes))
         self.emit('notice', 'Saved work does not fit a useful continuation; solving the original problem afresh')
@@ -520,7 +569,18 @@ class ProofRunner:
         if old_timeout is not None:
             client.timeout = max(0.1, min(old_timeout, remaining_seconds))
         try:
-            context = check_context(client, payload)
+            pending = self.state['pending']
+            minimum = (self.state['settings'].get('initial_min_solve_tokens', self.state['settings']['min_solve_tokens'])
+                       if role == 'solver' and pending['kind'] in {'initial', 'retry'} else
+                       self.state['settings']['min_solve_tokens'] if role == 'solver' else 128)
+            try:
+                payload, context = allocate_call(client, payload, cap, minimum=min(minimum, cap),
+                                                 explicit_cap=self.state['settings'].get('specialist_output_cap'))
+            except CallContextError as exc:
+                raise ProofContext(str(exc) + ' Candidate retained.') from exc
+            cap = payload['options']['num_predict']
+            if role == 'solver':
+                pending['solver_cap'] = cap
         finally:
             if old_timeout is not None:
                 client.timeout = old_timeout
@@ -590,10 +650,12 @@ class ProofRunner:
         selected = self._get_candidate(selected_id) if selected_id else None
         initial = self._get_candidate(initial_id) if initial_id else None
         answer = self._candidate_text(selected) if selected else ''
+        token_limit = self.state['settings']['max_tokens']
+        token_usage = str(self.state['tokens_charged']) + (f' / {token_limit}' if token_limit is not None else ' (no cumulative limit)')
         lines = ['# Square Harness proof run', '', f'Status: **{self.state["status"]}**', '',
                  self.state.get('stop_reason', ''), '',
                  'Model reviews are fallible assessments, not formal proof certificates.', '',
-                 f'Generated tokens charged: {self.state["tokens_charged"]} / {self.state["settings"]["max_tokens"]}.',
+                 f'Generated tokens charged: {token_usage}.',
                  f'Elapsed active seconds charged: {self.state["seconds_used"]:.1f}.', '',
                  '## Original problem', '', self.state['goal'], '', '## Candidates', '']
         for candidate in self.state['candidates']:

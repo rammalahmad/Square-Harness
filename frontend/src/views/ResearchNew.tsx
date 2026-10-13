@@ -1,6 +1,6 @@
 import { useEffect, useState, type FormEvent } from 'react'
 import { api, type ReviewVariant } from '../api'
-import { Collapse, ErrorNote, FilePicker, NumberField, Toggle } from '../components/common'
+import { Collapse, ErrorNote, FilePicker, NumberField, OptionalNumberField, Toggle } from '../components/common'
 import { EffortSlider, effortLimits, type EffortLevel } from '../components/Effort'
 import { useDropTarget } from '../drop'
 import { go } from '../router'
@@ -39,7 +39,7 @@ const REVIEW: Record<ReviewVariant, Copy> = {
   },
   journal: {
     title: 'Detailed review',
-    lede: 'Everything the review does, then the proofs are checked one at a time, main results first, with each alleged error re-checked, as far as the effort allows. It costs twice the tokens and time of a review at the same effort.',
+    lede: 'Everything the review does, then the proofs are checked one at a time, main results first, with each alleged error re-checked. The report identifies the checks completed and any work still pending. It allows twice the working time of a review at the same effort.',
     placeholder: 'Optional focus, e.g. concentrate on the proof of Theorem 1.4 and the lemmas it uses.',
     pinHint: 'Pin the manuscript (TeX, Markdown, text or PDF). Its snapshot stays fixed for the whole job.',
     field: 'Focus of the review (optional)', files: 'Manuscript', noun: 'detailed review',
@@ -76,9 +76,9 @@ export function ResearchNew({ kind }: { kind: Kind }) {
   const [target, setTarget] = useState('')
   const [files, setFiles] = useState<string[]>([])
   const [rounds, setRounds] = useState(3)
-  const [tokens, setTokens] = useState(60000)
+  const [tokens, setTokens] = useState<number | null>(null)
   const [minutes, setMinutes] = useState(15)
-  const [inputTokens, setInputTokens] = useState(240000)
+  const [inputTokens, setInputTokens] = useState<number | null>(null)
   const [requests, setRequests] = useState(12)
   const [chars, setChars] = useState(30000)
   const [error, setError] = useState('')
@@ -93,7 +93,7 @@ export function ResearchNew({ kind }: { kind: Kind }) {
   const scaled = (next: EffortLevel, kind: ReviewVariant = variant) => {
     const limits = effortLimits('research', d!, next)
     const scale = review ? VARIANT_SCALE[kind] : 1
-    return { ...limits, tokens: limits.tokens * scale, seconds: limits.seconds * scale, input_tokens: limits.input_tokens! * scale }
+    return { ...limits, seconds: limits.seconds * scale }
   }
   const applyLevel = (next: EffortLevel, kind: ReviewVariant = variant) => {
     if (!d) return
@@ -223,7 +223,7 @@ export function ResearchNew({ kind }: { kind: Kind }) {
           <span className="in-margin" />
           <div>
             {d && <EffortSlider kind="research" defaults={d} level={level} onLevel={chooseLevel} custom={custom} />}
-            {review && VARIANT_SCALE[variant] > 1 && <p className="field-hint">A detailed review gets twice these tokens, input and time.</p>}
+            {review && VARIANT_SCALE[variant] > 1 && <p className="field-hint">A detailed review allows twice this working time for proof checks.</p>}
             {!pasted && (
               <Toggle label="Search online" checked={searching} onChange={setOnline} disabled={status?.online_locked}
                 hint={status?.online_locked ? 'Launched with --offline: online search stays off.' : (kind === 'literature' ? 'Crossref, arXiv, zbMATH and Semantic Scholar.' : 'Checks cited results and compares the contribution with arXiv, Semantic Scholar and zbMATH.')} />
@@ -231,9 +231,9 @@ export function ResearchNew({ kind }: { kind: Kind }) {
             <Collapse summary="Advanced limits">
               <div className="field-grid">
                 <NumberField label={review ? 'Tries (sets passes and depth)' : 'Investigation rounds'} value={rounds} onChange={setRounds} min={1} max={100} />
-                <NumberField label="Generated tokens" value={tokens} onChange={setTokens} step={1000} />
+                <OptionalNumberField label="Total output token limit" value={tokens} onChange={setTokens} hint="Optional. Leave blank for no cumulative limit." />
                 <NumberField label="Time" value={minutes} onChange={setMinutes} min={1} suffix="min" />
-                <NumberField label="Input tokens" value={inputTokens} onChange={setInputTokens} step={10000} hint="Every call's context counts again" />
+                <OptionalNumberField label="Total input token limit" value={inputTokens} onChange={setInputTokens} step={10000} hint="Optional. Repeated input counts again; this is not the context size." />
                 {!pasted && <NumberField label="Web requests" value={requests} onChange={setRequests} min={0} max={100} hint={searching ? 'External retrievals' : 'Unused while offline'} />}
                 {!pasted && <NumberField label="Evidence characters" value={chars} onChange={setChars} min={1000} max={1000000} step={1000} hint="Returned by literature tools" />}
               </div>

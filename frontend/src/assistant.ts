@@ -9,5 +9,5 @@ export function routeActivity(item: TranscriptItem, snapshot: Pick<TaskSnapshot,
   return { queued, running }
 }
 
-export const assistantResumable = (chat: Pick<Chat, 'mode' | 'assistant_status'> | null) =>
-  chat?.mode === 'free' && chat.assistant_status === 'paused'
+export const assistantResumable = (chat: Pick<Chat, 'mode' | 'assistant_status' | 'assistant_resumable'> | null) =>
+  chat?.mode === 'free' && chat.assistant_status === 'paused' && (chat.assistant_resumable ?? true)
