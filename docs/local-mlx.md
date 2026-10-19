@@ -78,3 +78,5 @@ python -m unittest discover -s tests -v
 Protocol checks are not a model-quality or maximum-context benchmark. The
 versioned compatibility report records the tested checkpoint, server versions,
 source hashes, settings and observed proof-workflow outcome.
+
+See the [LFM2.5-8B-A1B results](compatibility/local-mlx-lfm.md).
