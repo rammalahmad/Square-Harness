@@ -87,21 +87,33 @@ set from 1 to 4. Other backends run one Assistant worker at a time. Workers in
 one conversation share that conversation's parent allowance and the interface's
 model-request slots; other conversations retain their own full allowance.
 
-### Other local OpenAI-compatible servers
+### MLX servers
 
-An already running MLX-compatible server can be selected explicitly:
+Connect to an already running server using its URL and served model ID:
 
 ```bash
+export MODEL_ID='your-served-model-id'
 square-harness --backend openai --api-profile mlx \
   --host http://localhost:8000 --model "$MODEL_ID" --offline --gui
 ```
 
-Set `MODEL_ID` to the exact ID advertised by your server. The MLX profile uses
-prompted JSON rather than constrained decoding; tokenizer/context extensions
-and thinking behavior depend on the server and checkpoint. See the
-[local MLX setup and compatibility notes](docs/local-mlx.md).
-The default OpenAI/vLLM profile is unchanged. Square connects to the server;
-model loading and serving configuration stay with that server.
+`--api-profile default` selects the existing vLLM adapter. The CLI option overrides
+`SQUARE_OPENAI_PROFILE`. Model loading stays with the inference server.
+
+The MLX profile prompts JSON and validates responses afterward. Seeds,
+reasoning-effort levels and vLLM thinking-budget fractions are unsupported.
+Checkpoint templates may ignore the thinking toggle.
+
+Local LLM Lab supplies optional `/api/tokenize` counting and a `context_limit`
+request field. Other servers may require context configuration at startup;
+missing tokenization uses the existing conservative estimate.
+
+To check a loaded model:
+
+```bash
+python scripts/test-local-mlx.py --host http://localhost:8000 \
+  --model "$MODEL_ID" --report .local/reports/mlx-protocol.json
+```
 
 ## Proof mode
 
